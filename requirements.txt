@@ -1,0 +1,11 @@
+
+flask
+flask-cors
+google-generativeai
+langchain
+sentence-transformers
+faiss-cpu
+torch
+transformers
+requests
+python-dotenv
