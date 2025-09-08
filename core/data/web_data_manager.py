@@ -24,30 +24,33 @@ class WebDataManager:
             self.last_update = current_time
         return self.cached_data
     
-    def _fetch_web_data(self) -> Dict:
+    def _fetch_web_data(self) -> dict:
         web_data = {
             "clinics": [],
             "specialties": [],
             "doctors": [],
             "handbooks": []
         }
+
         apis_to_call = [
             ("clinics", f"{BACKEND_API_BASE}/get-clinic?lang={BACKEND_LANG}"),
             ("specialties", f"{BACKEND_API_BASE}/get-specialty?lang={BACKEND_LANG}"),
             ("handbooks", f"{BACKEND_API_BASE}/get-handbook?lang={BACKEND_LANG}")
         ]
+
         for data_type, url in apis_to_call:
             try:
                 response = requests.get(url, timeout=5)
                 if response.status_code == 200:
                     data = response.json()
                     if data.get("errCode") == 0:
-                        items = data.get("data", [])[:8]
+                        items = data.get("data", [])[:10]  # Lấy tối đa 8 item
+                        # Loại bỏ image nếu có
                         for item in items:
                             if "image" in item:
                                 item.pop("image")
                         web_data[data_type] = items
-                        logger.info(f"Fetched {len(web_data[data_type])} {data_type}")
+                        logger.info(f"Fetched {len(items)} {data_type}")
                     else:
                         logger.warning(f"API error for {url}: {data.get('errMessage', 'Unknown')}")
                 else:
@@ -56,14 +59,16 @@ class WebDataManager:
                 logger.warning(f"Timeout fetching {data_type} from {url}")
             except Exception as e:
                 logger.warning(f"Error fetching {data_type}: {str(e)}")
-        
+
+        # Lấy doctors
         try:
             doctor_response = requests.get(f"{BACKEND_API_BASE}/get_all_doctor", timeout=5)
             if doctor_response.status_code == 200:
                 doctor_data = doctor_response.json()
                 if doctor_data.get("errCode") == 0:
-                    doctors = doctor_data.get("data", [])[:3]
+                    doctors = doctor_data.get("data", [])[:10]  # Lấy tối đa 10 doctor
                     detailed_doctors = []
+
                     for doctor in doctors:
                         try:
                             detail_response = requests.get(
@@ -73,24 +78,36 @@ class WebDataManager:
                             if detail_response.status_code == 200:
                                 detail_data = detail_response.json()
                                 if detail_data.get("errCode") == 0:
-                                    doctor_detail = detail_data.get("data", {})
-                                    if "image" in doctor_detail:
-                                        doctor_detail.pop("image")
+                                    doctor_detail = detail_data.get("data", {})  # Đây là 1 object duy nhất
+                                    # Loại bỏ image nếu có
+                                    doctor_detail.pop("image", None)
+
                                     detailed_doctor = {
                                         "id": doctor.get("id"),
                                         "firstName": doctor.get("firstName", ""),
                                         "lastName": doctor.get("lastName", ""),
-                                        "specialty": "Chuyên khoa tổng quát",
-                                        "clinic": doctor_detail.get("addressClinic", "N/A"),
-                                        "note": doctor_detail.get("note", "")[:100]
+                                        "specialty": doctor_detail.get("specialty", {}).get("name", ""),
+                                        "clinic": doctor_detail.get("nameClinic", doctor_detail.get("addressClinic", "N/A")),
+                                        "note": doctor_detail.get("note", "")[:100],
+                                        "price": doctor_detail.get("priceTypeData", {}).get("valueVi", ""),
+                                        "payment": doctor_detail.get("paymentTypeData", {}).get("valueVi", ""),
+                                        "province": doctor_detail.get("provinceTypeData", {}).get("valueVi", "")
                                     }
                                     detailed_doctors.append(detailed_doctor)
+                                    print("detailed_doctor", detailed_doctor)
                         except Exception as e:
                             logger.warning(f"Error fetching doctor {doctor.get('id')}: {str(e)}")
                             continue
+
                     web_data["doctors"] = detailed_doctors
                     logger.info(f"Fetched {len(detailed_doctors)} doctors")
         except Exception as e:
             logger.warning(f"Error fetching doctors: {str(e)}")
-        
+
+
         return web_data
+
+    
+
+
+   

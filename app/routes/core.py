@@ -57,7 +57,10 @@ def register_core_routes(app):
             return jsonify({"error": "Missing prompt"}), 400
         try:
             response = enhanced_chatbot.generate_response(prompt)
-            return jsonify({"response": response})
+            return Response(
+                json.dumps(response, ensure_ascii=False),  # ✅ giữ nguyên tiếng Việt
+                content_type="application/json; charset=utf-8"
+            )
         except Exception as e:
             logger.error(f"Question generation error: {e}")
             return jsonify({"status": "error", "message": "Error processing request"}), 500
