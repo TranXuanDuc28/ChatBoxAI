@@ -5,12 +5,13 @@ from langchain.callbacks.manager import CallbackManagerForLLMRun
 from pydantic import Field
 import logging
 import time
+from config.settings import GEMINI_MODEL
 
 logger = logging.getLogger("enhanced_medical_chatbot")
 
 class GeminiLLM(LLM):
     # Khai báo field cho pydantic
-    model_name: str = Field(default="gemini-1.5-flash", description="Tên model Gemini")
+    model_name: str = Field(default=GEMINI_MODEL, description="Tên model Gemini")
 
     @property
     def _llm_type(self) -> str:

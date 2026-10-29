@@ -8,7 +8,7 @@ from langchain.memory import ConversationBufferWindowMemory
 from langchain.chains import ConversationalRetrievalChain
 from langchain_core.prompts import PromptTemplate
 import logging
-from config.settings import GEMINI_API_KEY
+from config.settings import GEMINI_API_KEY, GEMINI_MODEL
 from typing import Dict, List, Optional, Tuple
 logger = logging.getLogger("enhanced_medical_chatbot")
 
@@ -78,7 +78,7 @@ class EnhancedMedicalChatbot:
         """Get system health status"""
         return {
             "status": "healthy",
-            "model": "gemini-1.5-flash",
+            "model": self.llm.model_name,
             "classifier_loaded": self.medical_classifier.model is not None,
             "vector_store_ready": self.vector_store.vectorstore is not None,
             "rag_chain_ready": self.rag_chain is not None,
@@ -117,7 +117,7 @@ class EnhancedMedicalChatbot:
     def _get_doctor_context(self, user_message: str) -> str:
         """Lấy ngữ cảnh về bác sĩ."""
         retriever = self.vector_store.as_retriever(search_kwargs={"k": 15})
-        docs = retriever.get_relevant_documents(user_message)
+        docs = retriever.invoke(user_message) if hasattr(retriever, 'invoke') else retriever.get_relevant_documents(user_message)
         
         # Ưu tiên docs về bác sĩ và chuyên khoa liên quan
         doctor_docs = [doc for doc in docs if doc.metadata.get("type") in ["doctor", "specialty", "specialty_detail"]]
@@ -131,7 +131,7 @@ class EnhancedMedicalChatbot:
     def _get_specialty_context(self, user_message: str) -> str:
         """Lấy ngữ cảnh về chuyên khoa."""
         retriever = self.vector_store.as_retriever(search_kwargs={"k": 15})
-        docs = retriever.get_relevant_documents(user_message)
+        docs = retriever.invoke(user_message) if hasattr(retriever, 'invoke') else retriever.get_relevant_documents(user_message)
         
         # Ưu tiên docs về chuyên khoa và bác sĩ thuộc chuyên khoa đó
         specialty_docs = [doc for doc in docs if doc.metadata.get("type") in ["specialty", "specialty_detail", "doctor"]]
@@ -145,13 +145,13 @@ class EnhancedMedicalChatbot:
         """Lấy ngữ cảnh khi người dùng mô tả triệu chứng."""
         # Tìm kiếm rộng hơn để bao gồm cả bác sĩ và chuyên khoa
         retriever = self.vector_store.as_retriever(search_kwargs={"k": 20})
-        docs = retriever.get_relevant_documents(user_message)
+        docs = retriever.invoke(user_message) if hasattr(retriever, 'invoke') else retriever.get_relevant_documents(user_message)
         
         # Tìm thêm bác sĩ liên quan
         symptom_keywords = self._extract_symptom_keywords(user_message)
         if symptom_keywords:
             for keyword in symptom_keywords[:2]:  # Chỉ lấy 2 từ khóa chính
-                extra_docs = retriever.get_relevant_documents(f"bác sĩ chuyên khoa {keyword}")
+                extra_docs = retriever.invoke(f"bác sĩ chuyên khoa {keyword}") if hasattr(retriever, 'invoke') else retriever.get_relevant_documents(f"bác sĩ chuyên khoa {keyword}")
                 docs.extend(extra_docs[:3])
         
         # Loại bỏ duplicate và ưu tiên
@@ -192,7 +192,7 @@ class EnhancedMedicalChatbot:
     def _get_general_context(self, user_message: str) -> str:
         """Lấy ngữ cảnh thông thường."""
         retriever = self.vector_store.as_retriever(search_kwargs={"k": 15})
-        docs = retriever.get_relevant_documents(user_message)
+        docs = retriever.invoke(user_message) if hasattr(retriever, 'invoke') else retriever.get_relevant_documents(user_message)
         return "\n".join([doc.page_content for doc in docs])
     
     # Cập nhật phương thức generate_response để sử dụng smart context
@@ -674,5 +674,54 @@ class EnhancedMedicalChatbot:
                     break
         
         return base_response
+
+    def get_suggestions(self, partial: str = "") -> List[str]:
+        """Gợi ý câu hỏi thường gặp hoặc theo từ khóa của người dùng."""
+        default_suggestions = [
+            "Tôi bị đau đầu, chóng mặt có sao không?",
+            "Làm sao để đặt lịch khám bác sĩ?",
+            "Khám chuyên khoa tim mạch ở đâu uy tín?",
+            "Triệu chứng cảm cúm và cách phòng ngừa?",
+            "Tôi bị đau dạ dày cần kiêng ăn gì?"
+        ]
+        if not partial or not partial.strip():
+            return default_suggestions[:4]
+
+        partial_lower = partial.strip().lower()
+        matched = []
+
+        # Kiểm tra trùng với câu hỏi mặc định
+        for item in default_suggestions:
+            if partial_lower in item.lower():
+                matched.append(item)
+
+        # Kiểm tra chuyên khoa & bác sĩ từ dữ liệu web
+        try:
+            web_data = self.web_data_manager.get_web_data()
+            specialties = web_data.get('specialties', [])
+            for sp in specialties:
+                name = sp.get('name', '')
+                if name and (partial_lower in name.lower() or any(w in name.lower() for w in partial_lower.split())):
+                    matched.append(f"Tôi muốn tư vấn về chuyên khoa {name}")
+                    matched.append(f"Danh sách bác sĩ chuyên khoa {name}")
+                    break
+
+            doctors = web_data.get('doctors', [])
+            for doc in doctors:
+                name = doc.get('name', '')
+                if name and partial_lower in name.lower():
+                    matched.append(f"Thông tin khám bệnh của {name}")
+                    break
+        except Exception as e:
+            logger.warning(f"Error creating suggestions: {e}")
+
+        # Bổ sung các gợi ý mặc định nếu chưa đủ
+        for item in default_suggestions:
+            if item not in matched:
+                matched.append(item)
+            if len(matched) >= 4:
+                break
+
+        return matched[:4]
 
 enhanced_chatbot = EnhancedMedicalChatbot()

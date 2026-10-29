@@ -94,7 +94,6 @@ class WebDataManager:
                                         "province": doctor_detail.get("provinceTypeData", {}).get("valueVi", "")
                                     }
                                     detailed_doctors.append(detailed_doctor)
-                                    print("detailed_doctor", detailed_doctor)
                         except Exception as e:
                             logger.warning(f"Error fetching doctor {doctor.get('id')}: {str(e)}")
                             continue

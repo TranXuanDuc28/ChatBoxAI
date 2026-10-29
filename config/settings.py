@@ -8,6 +8,7 @@ load_dotenv()
 logger = logging.getLogger("enhanced_medical_chatbot")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 BACKEND_API_BASE = os.getenv("BACKEND_API_BASE")
 BACKEND_LANG = os.getenv("BACKEND_LANG")
 

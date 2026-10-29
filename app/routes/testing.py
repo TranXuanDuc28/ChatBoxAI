@@ -133,6 +133,6 @@ def register_testing_routes(app):
         return jsonify({
             "message": "Enhanced Medical Chatbot with LangChain - Available Endpoints",
             "server_status": "running",
-            "model": "gemini-1.5-flash + langchain",
+            "model": f"{enhanced_chatbot.llm.model_name} + langchain",
             "endpoints": endpoints
         })

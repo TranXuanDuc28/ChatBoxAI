@@ -13,7 +13,7 @@ def register_core_routes(app):
             enhanced_chatbot.refresh_data()
             return jsonify({
                 "message": "Enhanced Medical Chatbot với LangChain đã sẵn sàng",
-                "model": "gemini-1.5-flash",
+                "model": enhanced_chatbot.llm.model_name,
                 "status": "loaded",
                 "features": ["RAG", "PhoBERT Classification", "LangChain Integration"],
                 "health": enhanced_chatbot.get_health_status()
@@ -24,7 +24,7 @@ def register_core_routes(app):
 
     @app.route('/generate_stream_chatbox', methods=['POST'])
     def generate_stream_chatbox():
-        data = request.json
+        data = request.json or {}
         question = data.get('text', '')
         if not question:
             return jsonify({"error": "Missing question"}), 400
