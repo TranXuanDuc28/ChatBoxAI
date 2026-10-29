@@ -3,13 +3,12 @@ from core.classifier.medical_classifier import MedicalClassifier
 from core.vector_store.enhanced_vector_store import EnhancedVectorStore
 from core.vector_store.embeddings import SentenceTransformerEmbeddings
 from core.data.web_data_manager import WebDataManager
+from core.memory.session_manager import SessionMemoryManager
 from config.prompts import MEDICAL_SYSTEM_PROMPT
-from langchain.memory import ConversationBufferWindowMemory
-from langchain.chains import ConversationalRetrievalChain
-from langchain_core.prompts import PromptTemplate
 import logging
 from config.settings import GEMINI_API_KEY, GEMINI_MODEL
 from typing import Dict, List, Optional, Tuple
+import json
 logger = logging.getLogger("enhanced_medical_chatbot")
 
 class EnhancedMedicalChatbot:
@@ -20,59 +19,50 @@ class EnhancedMedicalChatbot:
         self.vector_store = EnhancedVectorStore(self.embeddings)
         self.llm = GeminiLLM()
         self.streaming_llm = GeminiStreamingLLM()
-        self.memory = ConversationBufferWindowMemory(
-            k=6,
-            memory_key="chat_history",
-            output_key="answer",  # Thêm output_key để chỉ định rõ key đầu ra
-            return_messages=True
-        )
-        self.rag_chain = None
-        self.suggestion_chain = None
+        self.session_manager = SessionMemoryManager(ttl_seconds=7200, k=6)
         self.setup_chains()
     
     def setup_chains(self):
         web_data = self.web_data_manager.get_web_data()
         self.vector_store.build_from_web_data(web_data)
         
-        if self.vector_store.vectorstore is not None:
-            retriever = self.vector_store.as_retriever(search_kwargs={"k": 20})
-            prompt_template = PromptTemplate(
-                input_variables=["context", "chat_history", "question"],
-                template=MEDICAL_SYSTEM_PROMPT
-            )
-            self.rag_chain = ConversationalRetrievalChain.from_llm(
-                llm=self.llm,
-                retriever=retriever,
-                memory=self.memory,
-                return_source_documents=True,
-                combine_docs_chain_kwargs={"prompt": prompt_template},
-                output_key="answer"  # Đảm bảo output_key được đặt đúng
-            )
-            logger.info("RAG chain initialized successfully")
-        else:
-            logger.warning("Vector store not available, using simple LLM chain")
-            prompt_template = PromptTemplate(
-                input_variables=["chat_history", "question"],
-                template="""Bạn là trợ lý y tế. 
-                Chat history: {chat_history}
-                Human: {question}
-                Assistant:"""
-            )
-            self.rag_chain = prompt_template | self.llm
+        # Tự động trích xuất danh sách tỉnh thành và chuyên khoa từ dữ liệu hệ thống
+        doctors = web_data.get("doctors", [])
         
-        suggestion_prompt = PromptTemplate(
-            input_variables=["original_question"],
-            template="""Người dùng vừa hỏi: "{original_question}"
-            Tuy nhiên câu hỏi này không thuộc lĩnh vực y tế.
-            Hãy đề xuất 1 câu hỏi tương tự nhưng liên quan đến y tế.
-            Trả lời bằng 1 câu hỏi duy nhất, tiếng Việt:"""
-        )
-        self.suggestion_chain = suggestion_prompt | self.llm
+        # 1. Tỉnh thành
+        provinces_set = set()
+        for doc in doctors:
+            prov = doc.get("province")
+            if prov and prov != "N/A":
+                provinces_set.add(prov.strip())
+        self.provinces = list(provinces_set)
+        if not self.provinces:
+            self.provinces = ["Hà Nội", "Hồ Chí Minh", "Đà Nẵng"]
+        logger.info(f"Automatically loaded {len(self.provinces)} provinces from database: {self.provinces}")
+        
+        # 2. Chuyên khoa
+        specialties_set = set()
+        for spec in web_data.get("specialties", []):
+            name = spec.get("name")
+            if name:
+                specialties_set.add(name.strip())
+        for doc in doctors:
+            spec = doc.get("specialty")
+            if spec and spec != "N/A":
+                specialties_set.add(spec.strip())
+        self.specialties = list(specialties_set)
+        if not self.specialties:
+            self.specialties = ["Cơ xương khớp", "Nhi khoa", "Da liễu", "Tim mạch", "Thần kinh", "Tiêu hóa", "Tai mũi họng", "Phụ khoa"]
+        logger.info(f"Automatically loaded {len(self.specialties)} specialties from database: {self.specialties}")
     
     def refresh_data(self):
         logger.info("Refreshing web data...")
         self.web_data_manager.last_update = 0
         self.setup_chains()
+
+    def clear_memory(self, session_id: Optional[str] = None):
+        """Xóa lịch sử trò chuyện của một phiên cụ thể."""
+        self.session_manager.clear_session(session_id)
     
     def get_health_status(self):
         """Get system health status"""
@@ -81,38 +71,62 @@ class EnhancedMedicalChatbot:
             "model": self.llm.model_name,
             "classifier_loaded": self.medical_classifier.model is not None,
             "vector_store_ready": self.vector_store.vectorstore is not None,
-            "rag_chain_ready": self.rag_chain is not None,
-            "memory_messages": len(self.memory.chat_memory.messages),
+            "active_sessions": len(self.session_manager.sessions),
             "api_key_configured": bool(GEMINI_API_KEY)
         }
+
+    def check_emergency(self, message: str) -> Optional[str]:
+        """Kiểm tra dấu hiệu cấp cứu đỏ (Red Flags) để cảnh báo khẩn cấp ngay lập tức."""
+        msg_lower = message.lower()
+        emergency_keywords = [
+            "bất tỉnh", "bat tinh", "ngất xỉu", "ngat xiu", "hôn mê", "hon me",
+            "khó thở dữ dội", "kho tho du doi", "ngưng thở", "ngung tho",
+            "nôn ra máu", "non ra mau", "ho ra máu", "ho ra mau", "xuất huyết",
+            "đau thắt ngực dữ dội", "dau that nguc du doi", "đau ngực lan",
+            "co giật", "co giat", "méo miệng", "meo mieng", "liệt nửa người", "liet nua nguoi",
+            "tai biến", "đột quỵ", "dot quy"
+        ]
+        for kw in emergency_keywords:
+            if kw in msg_lower:
+                return (
+                    f"🚨 **CẢNH BÁO Y TẾ KHẨN CẤP** 🚨\n\n"
+                    f"Triệu chứng bạn vừa mô tả (**{kw}**) là dấu hiệu cảnh báo nguy hiểm cấp tính cần được can thiệp y tế ngay lập tức!\n\n"
+                    f"👉 **HÀNH ĐỘNG NGAY**:\n"
+                    f"1. **Gọi cấp cứu 115** hoặc nhờ người thân đưa bạn đến khoa **Cấp cứu Bệnh viện gần nhất** ngay lập tức.\n"
+                    f"2. Tuyệt đối không tự ý uống thuốc hoặc trì hoãn chờ đợi.\n"
+                    f"3. Giữ bình tĩnh, nằm nghỉ ngơi ở nơi thoáng khí trong khi chờ nhân viên y tế hỗ trợ."
+                )
+        return None
+
+    def check_greeting(self, message: str) -> Optional[str]:
+        """Kiểm tra và phản hồi câu chào hỏi thân thiện kèm giới thiệu năng lực hệ thống."""
+        msg_clean = message.strip().lower()
+        greetings = ["xin chào", "chào bạn", "chào bác sĩ", "chào bs", "hello", "hi", "alo", "hey", "bạn là ai", "hướng dẫn", "chức năng"]
+        if msg_clean in greetings or (len(msg_clean) <= 15 and any(msg_clean.startswith(g) for g in ["chào", "xin chào", "hello", "hi"])):
+            return (
+                "👋 **Xin chào bạn! Tôi là Trợ lý Y tế Thông minh của Hệ thống Đặt lịch Khám bệnh.**\n\n"
+                "Tôi có thể đồng hành và hỗ trợ bạn các vấn đề y tế sau:\n"
+                "- 🩺 **Tư vấn & Phân tích triệu chứng:** Đánh giá tình trạng sức khỏe ban đầu, cảnh báo nguy cơ và gợi ý chuyên khoa phù hợp.\n"
+                "- 👨‍⚕️ **Tra cứu Bác sĩ & Lịch khám:** Tìm bác sĩ giỏi theo chuyên khoa, khu vực (Hà Nội, TP.HCM, Đà Nẵng...) và xem lịch khám trực tuyến trong 7 ngày tới.\n"
+                "- 🏥 **Gói khám sức khỏe:** Tra cứu các gói khám tổng quát, gói tầm soát bệnh lý, bảng giá và danh mục dịch vụ.\n"
+                "- 🏢 **Bệnh viện & Phòng khám:** Cung cấp địa chỉ, tuyến viện, dịch vụ mũi nhọn và thời gian làm việc.\n\n"
+                "Bạn đang có thắc mắc gì về sức khỏe hoặc cần hỗ trợ đặt lịch khám chuyên khoa nào, hãy chia sẻ cùng tôi nhé!"
+            )
+        return None
     def get_smart_context(self, user_message: str) -> str:
-        """Lấy ngữ cảnh thông minh dựa trên câu hỏi của người dùng."""
+        """Lấy ngữ cảnh thông minh bằng Hybrid Search và Reranking."""
         if self.vector_store.vectorstore is None:
             return "Không có thông tin bổ sung"
         
         try:
-            # Phân tích ý định câu hỏi
-            message_lower = user_message.lower()
-            
-            # Nếu hỏi về bác sĩ cụ thể
-            if any(word in message_lower for word in ["bác sĩ", "doctor", "bs"]):
-                return self._get_doctor_context(user_message)
-            
-            # Nếu hỏi về chuyên khoa
-            elif any(word in message_lower for word in ["chuyên khoa", "khoa", "specialty"]):
-                return self._get_specialty_context(user_message)
-            
-            # Nếu mô tả triệu chứng - tìm bác sĩ phù hợp
-            elif any(word in message_lower for word in ["đau", "bệnh", "triệu chứng", "khám", "chữa"]):
-                return self._get_symptom_context(user_message)
-            
-            # Tìm kiếm thông thường
-            else:
-                return self._get_general_context(user_message)
-                
+            docs = self.vector_store.hybrid_search_with_rerank(user_message, k=10)
+            return "\n".join([doc.page_content for doc in docs])
         except Exception as e:
             logger.warning(f"Smart context error: {e}")
-            return self._get_general_context(user_message)
+            try:
+                return self._get_general_context(user_message)
+            except Exception:
+                return "Lỗi khi lấy thông tin ngữ cảnh"
 
     def _get_doctor_context(self, user_message: str) -> str:
         """Lấy ngữ cảnh về bác sĩ."""
@@ -195,99 +209,240 @@ class EnhancedMedicalChatbot:
         docs = retriever.invoke(user_message) if hasattr(retriever, 'invoke') else retriever.get_relevant_documents(user_message)
         return "\n".join([doc.page_content for doc in docs])
     
-    # Cập nhật phương thức generate_response để sử dụng smart context
-    def generate_response(self, user_message: str) -> str:
+    def _fallback_simple_response(self, user_message: str) -> str:
         """
-        Tạo phản hồi không streaming với ngữ cảnh thông minh và gợi ý bác sĩ.
+        Dùng bộ lọc từ khóa đơn giản để trả lời khi LLM bị lỗi/hết quota.
+        """
+        msg_lower = user_message.lower()
+        response = "⚠️ **Hệ thống AI đang quá tải**: Tôi đang trả lời bạn bằng chế độ truy xuất dữ liệu trực tiếp (Dự phòng).\n\n"
+        
+        # 1. Tìm theo tên bác sĩ hoặc chuyên khoa bằng từ khóa
+        doctors = []
+        # Trích xuất tên bác sĩ đơn giản
+        search_term = msg_lower.replace("bác sĩ", "").replace("bs", "").replace("lịch khám", "").replace("hôm nay", "").strip()
+        
+        # Ưu tiên tìm theo tên nếu search_term đủ dài
+        if len(search_term) > 2:
+            doctors = self.find_doctors_by_name(search_term)
+        
+        # Nếu không thấy theo tên, thử tìm theo chuyên khoa
+        if not doctors:
+            specs = getattr(self, 'specialties', [])
+            for spec in specs:
+                if spec.lower() in msg_lower:
+                    doctors = self.find_doctors_by_specialty(spec, limit=3)
+                    break
+
+        if doctors:
+            response += "Tôi tìm thấy thông tin sau trong hệ thống:\n\n"
+            for doc in doctors:
+                response += f"👨‍⚕️ **Bác sĩ {doc['name']}**\n"
+                response += f"- Chuyên khoa: {doc['specialty']}\n"
+                response += f"- Phòng khám: {doc['clinic']}\n"
+                # Lấy lịch khám nếu có
+                full_data = doc.get("full_data", {})
+                schedules = full_data.get("schedules", [])
+                if schedules:
+                    response += f"- Lịch khám: {'; '.join(schedules)}\n"
+                response += f"- Giá khám: {doc.get('price', 'N/A')}\n"
+                response += "\n"
+            return response
+
+        # 2. Cuối cùng, nếu ko khớp gì thì lấy ngữ cảnh thô từ VectorDB
+        context = self.get_smart_context(user_message)
+        if context and len(context) > 20:
+            response += "Dữ liệu liên quan từ hệ thống:\n"
+            # Làm sạch context một chút
+            clean_context = context.replace("\n\n", "\n").strip()
+            response += clean_context[:1000]
+            return response
+            
+        return "Xin lỗi, AI đang bận và tôi không tìm thấy dữ liệu phù hợp trong chế độ dự phòng. Bạn vui lòng thử lại sau vài phút."
+
+    # Cập nhật phương thức generate_response để sử dụng smart context, multi-session và fallback
+    def generate_response(self, user_message: str, session_id: Optional[str] = "default_session") -> str:
+        """
+        Tạo phản hồi không streaming với ngữ cảnh thông minh và quản lý phiên độc lập.
         """
         try:
-            # Lấy ngữ cảnh thông minh
+            # 1. Kiểm tra trường hợp cấp cứu khẩn cấp (Red Flags)
+            emergency_alert = self.check_emergency(user_message)
+            if emergency_alert:
+                self.session_manager.add_user_message(session_id, user_message)
+                self.session_manager.add_ai_message(session_id, emergency_alert)
+                return emergency_alert
+
+            # 2. Kiểm tra câu chào hỏi / giới thiệu ban đầu
+            greeting_resp = self.check_greeting(user_message)
+            if greeting_resp:
+                self.session_manager.add_user_message(session_id, user_message)
+                self.session_manager.add_ai_message(session_id, greeting_resp)
+                return greeting_resp
+
+            # 3. Sử dụng PhoBERT để kiểm duyệt nếu câu hỏi hoàn toàn phi y tế
+            if hasattr(self, 'medical_classifier') and self.medical_classifier:
+                try:
+                    is_med, conf = self.medical_classifier.is_medical_question(user_message)
+                    if not is_med and conf > 0.85:
+                        out_of_scope = (
+                            "Xin lỗi bạn, tôi là Trợ lý Y tế Thông minh và chỉ được đào tạo chuyên sâu về "
+                            "lĩnh vực y tế, sức khỏe, bác sĩ và đặt lịch khám bệnh. Tôi không thể hỗ trợ các chủ đề ngoài y tế.\n\n"
+                            "Nếu bạn có bất kỳ câu hỏi nào về sức khỏe, triệu chứng bệnh hoặc cần tìm bác sĩ/gói khám, "
+                            "xin vui lòng hỏi tôi nhé!"
+                        )
+                        self.session_manager.add_user_message(session_id, user_message)
+                        self.session_manager.add_ai_message(session_id, out_of_scope)
+                        return out_of_scope
+                except Exception as cf_err:
+                    logger.warning(f"Classification check skipped: {cf_err}")
+
+            # 4. Lấy ngữ cảnh thông minh
             context = self.get_smart_context(user_message)
             
-            # Lấy lịch sử trò chuyện
-            chat_history = ""
-            if self.memory.chat_memory.messages:
-                recent_messages = self.memory.chat_memory.messages[-4:]
-                for msg in recent_messages:
-                    if hasattr(msg, 'content'):
-                        role = "Human" if msg.__class__.__name__ == "HumanMessage" else "Assistant"
-                        chat_history += f"{role}: {msg.content}\n"
+            # 5. Lấy lịch sử trò chuyện theo đúng phiên
+            chat_history = self.session_manager.get_chat_history_str(session_id)
 
-            # Tạo prompt với MEDICAL_SYSTEM_PROMPT
+            # 6. Tạo prompt với MEDICAL_SYSTEM_PROMPT
             prompt = MEDICAL_SYSTEM_PROMPT.format(
                 context=context,
                 chat_history=chat_history,
                 question=user_message
             )
 
-            # Gọi LLM để tạo phản hồi
+            # 7. Gọi LLM để tạo phản hồi
             response = self.llm.invoke(prompt)
             if isinstance(response, dict) and "text" in response:
                 response = response["text"]
+            elif hasattr(response, 'content'):
+                response = response.content
+            else:
+                response = str(response)
 
-            # Tăng cường phản hồi với gợi ý bác sĩ
-            enhanced_response = self.enhance_response_with_doctor_suggestions(user_message, response)
-
-            # Cập nhật bộ nhớ trò chuyện
+            # Cập nhật bộ nhớ trò chuyện của phiên
             try:
-                self.memory.chat_memory.add_user_message(user_message)
-                self.memory.chat_memory.add_ai_message(enhanced_response)
+                self.session_manager.add_user_message(session_id, user_message)
+                self.session_manager.add_ai_message(session_id, response)
             except Exception as e:
                 logger.warning(f"Memory update error: {e}")
 
-            return enhanced_response
+            return response
         except Exception as e:
             logger.error(f"Response generation error: {e}")
-            return "Xin lỗi, tôi đang gặp sự cố. Vui lòng thử lại sau."
+            fallback_res = self._fallback_simple_response(user_message)
+            self.session_manager.add_user_message(session_id, user_message)
+            self.session_manager.add_ai_message(session_id, fallback_res)
+            return fallback_res
 
-    def generate_streaming_response(self, user_message: str):
+    def generate_streaming_response(self, user_message: str, session_id: Optional[str] = "default_session"):
         """
-        Tạo phản hồi streaming với ngữ cảnh thông minh.
+        Tạo phản hồi streaming với ngữ cảnh thông minh và quản lý phiên độc lập.
         """
         try:
-            # Sử dụng smart context
+            # 1. Kiểm tra trường hợp cấp cứu khẩn cấp (Red Flags)
+            emergency_alert = self.check_emergency(user_message)
+            if emergency_alert:
+                yield emergency_alert
+                self.session_manager.add_user_message(session_id, user_message)
+                self.session_manager.add_ai_message(session_id, emergency_alert)
+                return
+
+            # 2. Kiểm tra câu chào hỏi / giới thiệu ban đầu
+            greeting_resp = self.check_greeting(user_message)
+            if greeting_resp:
+                yield greeting_resp
+                self.session_manager.add_user_message(session_id, user_message)
+                self.session_manager.add_ai_message(session_id, greeting_resp)
+                return
+
+            # 3. Sử dụng PhoBERT để kiểm duyệt nếu câu hỏi hoàn toàn phi y tế
+            if hasattr(self, 'medical_classifier') and self.medical_classifier:
+                try:
+                    is_med, conf = self.medical_classifier.is_medical_question(user_message)
+                    if not is_med and conf > 0.85:
+                        out_of_scope = (
+                            "Xin lỗi bạn, tôi là Trợ lý Y tế Thông minh và chỉ được đào tạo chuyên sâu về "
+                            "lĩnh vực y tế, sức khỏe, bác sĩ và đặt lịch khám bệnh. Tôi không thể hỗ trợ các chủ đề ngoài y tế.\n\n"
+                            "Nếu bạn có bất kỳ câu hỏi nào về sức khỏe, triệu chứng bệnh hoặc cần tìm bác sĩ/gói khám, "
+                            "xin vui lòng hỏi tôi nhé!"
+                        )
+                        yield out_of_scope
+                        self.session_manager.add_user_message(session_id, user_message)
+                        self.session_manager.add_ai_message(session_id, out_of_scope)
+                        return
+                except Exception as cf_err:
+                    logger.warning(f"Classification check skipped: {cf_err}")
+
+            # 4. Sử dụng smart context
             context = self.get_smart_context(user_message)
             
-            # Lấy lịch sử trò chuyện
-            chat_history = ""
-            if self.memory.chat_memory.messages:
-                recent_messages = self.memory.chat_memory.messages[-4:]
-                for msg in recent_messages:
-                    if hasattr(msg, 'content'):
-                        role = "Human" if msg.__class__.__name__ == "HumanMessage" else "Assistant"
-                        chat_history += f"{role}: {msg.content}\n"
+            # 5. Lấy lịch sử trò chuyện theo đúng phiên
+            chat_history = self.session_manager.get_chat_history_str(session_id)
             
-            # Tạo prompt
+            # 6. Tạo prompt
             prompt = MEDICAL_SYSTEM_PROMPT.format(
                 context=context,
                 chat_history=chat_history,
                 question=user_message
             )
             
-            # Stream response từ LLM
+            # 7. Stream response từ LLM
             full_response = ""
             for chunk in self.streaming_llm.stream_response(prompt):
                 full_response += chunk
                 yield chunk
             
-            # Sau khi stream xong, thêm gợi ý bác sĩ nếu cần
-            doctor_suggestions = self._get_doctor_suggestions_for_streaming(user_message)
-            if doctor_suggestions:
-                yield "\n\n"  # Xuống dòng
-                for suggestion_chunk in doctor_suggestions:
-                    yield suggestion_chunk
-                    full_response += suggestion_chunk
-            
-            # Cập nhật memory với response đầy đủ
+            # Cập nhật memory của phiên với response đầy đủ
             try:
-                self.memory.chat_memory.add_user_message(user_message)
-                self.memory.chat_memory.add_ai_message(full_response)
+                self.session_manager.add_user_message(session_id, user_message)
+                self.session_manager.add_ai_message(session_id, full_response)
             except Exception as e:
                 logger.warning(f"Memory update error: {e}")
                 
         except Exception as e:
             logger.error(f"Streaming error: {e}")
-            yield "Xin lỗi, tôi đang gặp sự cố. Vui lòng thử lại sau."
+            fallback_text = self._fallback_simple_response(user_message)
+            yield fallback_text
+            self.session_manager.add_user_message(session_id, user_message)
+            self.session_manager.add_ai_message(session_id, fallback_text)
+
+    def _detect_province_from_message(self, message: str) -> Optional[str]:
+        """Tự động phát hiện tỉnh thành từ câu hỏi dựa trên các tỉnh thành thực tế có trong hệ thống."""
+        if not hasattr(self, 'provinces') or not self.provinces:
+            return None
+            
+        msg_lower = message.lower()
+        
+        # Hàm loại bỏ dấu tiếng Việt và ký tự đặc biệt để so sánh chính xác hơn
+        def normalize_str(s):
+            import unicodedata
+            s = unicodedata.normalize('NFKD', s).encode('ascii', 'ignore').decode('utf-8')
+            return s.lower().replace(" ", "")
+
+        normalized_msg = normalize_str(msg_lower)
+        
+        for province in self.provinces:
+            prov_lower = province.lower()
+            normalized_prov = normalize_str(prov_lower)
+            
+            # Khớp trực tiếp có dấu (ví dụ: "đà nẵng" trong "tôi ở đà nẵng")
+            if prov_lower in msg_lower:
+                return province
+                
+            # Khớp không dấu (ví dụ: "da nang" trong "tôi ở da nang")
+            if normalized_prov in normalized_msg:
+                return province
+                
+            # Các từ viết tắt và tên ngắn phổ biến
+            if prov_lower == "hồ chí minh" and any(abbr in msg_lower for abbr in ["hcm", "tphcm", "sai gon", "sài gòn"]):
+                return province
+            if prov_lower == "hà nội" and "hn" in msg_lower.split():
+                return province
+            if "thừa thiên huế" in prov_lower and any(w in msg_lower for w in ["huế", "hue"]):
+                return province
+            if "đà nẵng" in prov_lower and any(w in msg_lower.split() for w in ["đn", "dn"]):
+                return province
+                
+        return None
 
     def _get_doctor_suggestions_for_streaming(self, user_message: str) -> List[str]:
         """
@@ -297,8 +452,8 @@ class EnhancedMedicalChatbot:
             message_lower = user_message.lower()
             suggestions = []
             
-            # Nếu hỏi về triệu chứng
-            if any(word in message_lower for word in ["đau", "bệnh", "triệu chứng", "khám"]):
+            # Nếu hỏi về triệu chứng (bỏ từ 'khám' để tránh nhầm với hỏi lịch khám thông thường)
+            if any(word in message_lower for word in ["đau", "bệnh", "triệu chứng", "mỏi", "nhức", "sốt", "ho", "mệt", "ngứa"]):
                 doctors = self.suggest_doctors_for_symptoms(user_message, limit=3)
                 if doctors:
                     suggestions.append("🩺 **Gợi ý bác sĩ phù hợp:**\n")
@@ -313,19 +468,29 @@ class EnhancedMedicalChatbot:
             
             # Nếu hỏi về chuyên khoa
             elif any(word in message_lower for word in ["chuyên khoa", "khoa"]):
-                words = message_lower.split()
-                for i, word in enumerate(words):
-                    if word in ["chuyên", "khoa"] and i < len(words) - 1:
-                        specialty_name = words[i + 1]
-                        doctors = self.find_doctors_by_specialty(specialty_name, limit=3)
-                        if doctors:
-                            suggestions.append(f"👨‍⚕️ **Các bác sĩ chuyên khoa {specialty_name}:**\n")
-                            for j, doctor in enumerate(doctors, 1):
-                                doctor_info = f"{j}. **Bác sĩ {doctor['name']}**\n"
-                                doctor_info += f"   📍 {doctor['clinic']}, {doctor['province']}\n"
-                                doctor_info += f"   💰 {doctor['price']}\n\n"
-                                suggestions.append(doctor_info)
+                detected_specialty = None
+                specs = getattr(self, 'specialties', [])
+                for spec in specs:
+                    if spec.lower() in message_lower:
+                        detected_specialty = spec
                         break
+                
+                if detected_specialty:
+                    doctors = self.find_doctors_by_specialty(detected_specialty, limit=5)
+                    
+                    # Lọc theo tỉnh thành nếu có trong câu hỏi
+                    target_province = self._detect_province_from_message(user_message)
+                    if target_province:
+                        doctors = [d for d in doctors if target_province.lower() in d.get("province", "").lower()]
+                        
+                    doctors = doctors[:3]
+                    if doctors:
+                        suggestions.append(f"👨‍⚕️ **Các bác sĩ chuyên khoa {detected_specialty}:**\n")
+                        for j, doctor in enumerate(doctors, 1):
+                            doctor_info = f"{j}. **Bác sĩ {doctor['name']}**\n"
+                            doctor_info += f"   📍 {doctor['clinic']}, {doctor['province']}\n"
+                            doctor_info += f"   💰 {doctor['price']}\n\n"
+                            suggestions.append(doctor_info)
             
             return suggestions
             
@@ -366,70 +531,11 @@ class EnhancedMedicalChatbot:
         """
         Debug method để xem AI đang chọn context như thế nào.
         """
-        message_lower = user_message.lower()
-        
-        context_info = {
+        return {
             "message": user_message,
-            "detected_intent": "general",
-            "keywords_found": [],
-            "context_strategy": "general_search"
+            "detected_intent": "semantic_search",
+            "context_strategy": "vector_database_rag"
         }
-        
-        # Phân tích ý định
-        if any(word in message_lower for word in ["bác sĩ", "doctor", "bs"]):
-            context_info["detected_intent"] = "doctor_inquiry"
-            context_info["context_strategy"] = "doctor_focused"
-            context_info["keywords_found"] = [word for word in ["bác sĩ", "doctor", "bs"] if word in message_lower]
-        
-        elif any(word in message_lower for word in ["chuyên khoa", "khoa", "specialty"]):
-            context_info["detected_intent"] = "specialty_inquiry"
-            context_info["context_strategy"] = "specialty_focused"
-            context_info["keywords_found"] = [word for word in ["chuyên khoa", "khoa", "specialty"] if word in message_lower]
-        
-        elif any(word in message_lower for word in ["đau", "bệnh", "triệu chứng", "khám", "chữa"]):
-            context_info["detected_intent"] = "symptom_description"
-            context_info["context_strategy"] = "symptom_to_doctor_matching"
-            context_info["keywords_found"] = [word for word in ["đau", "bệnh", "triệu chứng", "khám", "chữa"] if word in message_lower]
-            
-            # Thêm symptom keywords
-            symptom_keywords = self._extract_symptom_keywords(user_message)
-            if symptom_keywords:
-                context_info["symptom_keywords"] = symptom_keywords
-        
-        return context_info
-
-    # Method để test hiệu suất của từng strategy
-    def test_context_strategies(self, user_message: str) -> Dict:
-        """
-        Test các strategy khác nhau để so sánh hiệu quả.
-        """
-        if self.vector_store.vectorstore is None:
-            return {"error": "Vector store not available"}
-        
-        strategies = {
-            "general": self._get_general_context(user_message),
-            "doctor_focused": self._get_doctor_context(user_message),
-            "specialty_focused": self._get_specialty_context(user_message),
-            "symptom_focused": self._get_symptom_context(user_message),
-            "smart": self.get_smart_context(user_message)
-        }
-        
-        # Đếm số lượng thông tin về bác sĩ/chuyên khoa trong mỗi strategy
-        results = {}
-        for strategy_name, context in strategies.items():
-            doctor_mentions = context.lower().count("bác sĩ")
-            specialty_mentions = context.lower().count("chuyên khoa")
-            context_length = len(context)
-            
-            results[strategy_name] = {
-                "context_length": context_length,
-                "doctor_mentions": doctor_mentions,
-                "specialty_mentions": specialty_mentions,
-                "relevance_score": (doctor_mentions + specialty_mentions) / max(context_length / 1000, 1),
-                "context_preview": context[:200] + "..." if len(context) > 200 else context
-            }
-        
-        return results
     # Thêm vào class EnhancedMedicalChatbot
 
     def find_doctors_by_name(self, doctor_name: str) -> List[Dict]:
@@ -596,6 +702,34 @@ class EnhancedMedicalChatbot:
             logger.error(f"Error getting specialty overview: {e}")
             return {"error": str(e)}
 
+    def _extract_symptom_keywords(self, symptoms: str) -> List[str]:
+        """
+        Sử dụng LLM để trích xuất các chuyên khoa phù hợp từ triệu chứng.
+        """
+        prompt = f"""Phân tích các triệu chứng sau và trả về danh sách tên các chuyên khoa y tế phù hợp nhất (ví dụ: Cơ xương khớp, Nhi khoa, Da liễu...).
+        
+        Triệu chứng: {symptoms}
+        
+        Trả về kết quả dưới dạng danh sách tên chuyên khoa, cách nhau bởi dấu phẩy. Không giải thích gì thêm.
+        Ví dụ: Cơ xương khớp, Thần kinh"""
+        
+        try:
+            response = self.llm.invoke(prompt)
+            if isinstance(response, dict) and "text" in response:
+                content = response["text"]
+            else:
+                content = str(response)
+                
+            specialties = [s.strip() for s in content.split(",") if s.strip()]
+            return specialties
+        except Exception as e:
+            logger.error(f"Error extracting symptom keywords: {e}")
+            # Fallback cơ bản nếu API bị lỗi/quota
+            message_lower = symptoms.lower()
+            if any(word in message_lower for word in ["xương", "khớp", "đau chân", "đau tay", "lưng"]):
+                return ["Cơ xương khớp"]
+            return []
+
     def suggest_doctors_for_symptoms(self, symptoms: str, limit: int = 3) -> List[Dict]:
         """
         Đề xuất bác sĩ dựa trên triệu chứng mô tả.
@@ -607,11 +741,20 @@ class EnhancedMedicalChatbot:
             if not symptom_keywords:
                 return []
             
+            # Kiểm tra xem có yêu cầu về tỉnh thành không
+            target_province = self._detect_province_from_message(symptoms)
+            
             suggested_doctors = []
             
             # Tìm bác sĩ cho từng chuyên khoa liên quan
             for specialty in symptom_keywords:
-                doctors = self.find_doctors_by_specialty(specialty, limit=2)
+                # Lấy số lượng nhiều hơn để lọc theo tỉnh thành
+                doctors = self.find_doctors_by_specialty(specialty, limit=10)
+                
+                # Nếu có tỉnh thành đích, lọc theo tỉnh thành
+                if target_province:
+                    doctors = [d for d in doctors if target_province.lower() in d.get("province", "").lower()]
+                
                 for doctor in doctors:
                     doctor["suggested_reason"] = f"Chuyên khoa {specialty} phù hợp với triệu chứng của bạn"
                     suggested_doctors.append(doctor)
@@ -639,8 +782,8 @@ class EnhancedMedicalChatbot:
         """
         message_lower = user_message.lower()
         
-        # Nếu người dùng hỏi về triệu chứng
-        if any(word in message_lower for word in ["đau", "bệnh", "triệu chứng", "khám"]):
+        # Nếu người dùng hỏi về triệu chứng (bỏ từ 'khám' để tránh nhầm với hỏi lịch khám thông thường)
+        if any(word in message_lower for word in ["đau", "bệnh", "triệu chứng", "mỏi", "nhức", "sốt", "ho", "mệt", "ngứa"]):
             doctors = self.suggest_doctors_for_symptoms(user_message, limit=3)
             if doctors:
                 suggestion_text = "\n\n🩺 **Gợi ý bác sĩ phù hợp:**\n"
@@ -656,22 +799,30 @@ class EnhancedMedicalChatbot:
         
         # Nếu người dùng hỏi về chuyên khoa cụ thể
         elif any(word in message_lower for word in ["chuyên khoa", "khoa"]):
-            # Trích xuất tên chuyên khoa từ câu hỏi
-            # Đây là logic đơn giản, có thể cải thiện bằng NER
-            words = message_lower.split()
-            for i, word in enumerate(words):
-                if word in ["chuyên", "khoa"] and i < len(words) - 1:
-                    specialty_name = words[i + 1]
-                    doctors = self.find_doctors_by_specialty(specialty_name, limit=5)
-                    if doctors:
-                        suggestion_text = f"\n\n👨‍⚕️ **Các bác sĩ chuyên khoa {specialty_name}:**\n"
-                        for i, doctor in enumerate(doctors, 1):
-                            suggestion_text += f"{i}. **Bác sĩ {doctor['name']}**\n"
-                            suggestion_text += f"   📍 {doctor['clinic']}, {doctor['province']}\n"
-                            suggestion_text += f"   💰 {doctor['price']}\n\n"
-                        
-                        return base_response + suggestion_text
+            detected_specialty = None
+            specs = getattr(self, 'specialties', [])
+            for spec in specs:
+                if spec.lower() in message_lower:
+                    detected_specialty = spec
                     break
+            
+            if detected_specialty:
+                doctors = self.find_doctors_by_specialty(detected_specialty, limit=5)
+                
+                # Lọc theo tỉnh thành nếu có trong câu hỏi
+                target_province = self._detect_province_from_message(user_message)
+                if target_province:
+                    doctors = [d for d in doctors if target_province.lower() in d.get("province", "").lower()]
+                
+                doctors = doctors[:3]
+                if doctors:
+                    suggestion_text = f"\n\n👨‍⚕️ **Các bác sĩ chuyên khoa {detected_specialty}:**\n"
+                    for idx, doctor in enumerate(doctors, 1):
+                        suggestion_text += f"{idx}. **Bác sĩ {doctor['name']}**\n"
+                        suggestion_text += f"   📍 {doctor['clinic']}, {doctor['province']}\n"
+                        suggestion_text += f"   💰 {doctor['price']}\n\n"
+                    
+                    return base_response + suggestion_text
         
         return base_response
 
@@ -723,5 +874,47 @@ class EnhancedMedicalChatbot:
                 break
 
         return matched[:4]
+
+    def summarize_medical_history(self, history_data: List[Dict]) -> str:
+        """
+        Tóm tắt lịch sử khám bệnh của bệnh nhân.
+        """
+        if not history_data:
+            return "Không có dữ liệu lịch sử khám bệnh để tóm tắt."
+        
+        try:
+            # Chuẩn bị nội dung lịch sử để tóm tắt
+            history_text = ""
+            for i, entry in enumerate(history_data, 1):
+                raw_desc = entry.get("description", "{}")
+                try:
+                    details = json.loads(raw_desc)
+                    desc_text = f"Chẩn đoán: {details.get('diagnosis', 'N/A')}. Triệu chứng: {details.get('clinicalExam', 'N/A')}. Điều trị: {details.get('treatment', 'N/A')}."
+                except:
+                    desc_text = raw_desc
+                
+                history_text += f"Lần {i}: Bác sĩ {entry.get('User', {}).get('firstName', '')} {entry.get('User', {}).get('lastName', '')}. {desc_text}\n"
+            
+            prompt = f"""Bạn là một chuyên gia y tế. Hãy tóm tắt lịch sử khám bệnh sau đây của bệnh nhân một cách cực kỳ ngắn gọn (giúp bác sĩ nắm bắt tình trạng trong 5 giây).
+            Tập trung vào: các bệnh lý mãn tính, các triệu chứng lặp lại, và các chẩn đoán gần đây nhất.
+            
+            DỮ LIỆU LỊCH SỬ:
+            {history_text}
+            
+            YÊU CẦU:
+            1. Trả về kết quả bằng tiếng Việt.
+            2. Sử dụng các gạch đầu dòng ngắn gọn.
+            3. Không lặp lại các thông tin không quan trọng.
+            4. Nếu có triệu chứng đáng lo ngại, hãy in đậm.
+            """
+            
+            response = self.llm.invoke(prompt)
+            if isinstance(response, dict) and "text" in response:
+                return response["text"]
+            return str(response)
+            
+        except Exception as e:
+            logger.error(f"Error summarizing medical history: {e}")
+            return "Xin lỗi, đã xảy ra lỗi khi tóm tắt bệnh án."
 
 enhanced_chatbot = EnhancedMedicalChatbot()

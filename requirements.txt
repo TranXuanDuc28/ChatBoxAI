@@ -1,11 +1,15 @@
-
 flask
 flask-cors
 google-generativeai
-langchain
+langchain==0.1.20
+langchain-core==0.1.52
+langchain-community==0.0.38
 sentence-transformers
 faiss-cpu
 torch
 transformers
 requests
 python-dotenv
+pydantic==2.10.6
+qdrant-client
+rank-bm25

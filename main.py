@@ -1,12 +1,15 @@
+import sys
+import io
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+
 from app import create_app
 from utils.logging import setup_logging
-from core.chatbot import EnhancedMedicalChatbot
+from core.chatbot import enhanced_chatbot
 from config.settings import GEMINI_API_KEY, BACKEND_API_BASE, BACKEND_LANG
 
 logger = setup_logging()
 
 if __name__ == '__main__':
-    enhanced_chatbot = EnhancedMedicalChatbot()
     app = create_app()
     
     print("🚀 Enhanced Medical Chatbot with LangChain")
@@ -16,8 +19,8 @@ if __name__ == '__main__':
     print("✅ LangChain integrated")
     print("✅ PhoBERT classification model")
     print("✅ FAISS vector store")
-    print("✅ Enhanced memory management")
-    print("✅ RAG pipeline")
+    print("✅ Enhanced multi-session memory management")
+    print("✅ Hybrid RAG pipeline")
     print("✅ CORS configured")
     
     print("\n🔍 System configuration...")
@@ -27,9 +30,9 @@ if __name__ == '__main__':
     
     try:
         health_status = enhanced_chatbot.get_health_status()
-        print(f"✅ Classifier loaded: {'✓' if health_status['classifier_loaded'] else '✗'}")
-        print(f"✅ Vector store ready: {'✓' if health_status['vector_store_ready'] else '✗'}")
-        print(f"✅ RAG chain ready: {'✓' if health_status['rag_chain_ready'] else '✗'}")
+        print(f"✅ Classifier loaded: {'✓' if health_status.get('classifier_loaded') else '✗'}")
+        print(f"✅ Vector store ready: {'✓' if health_status.get('vector_store_ready') else '✗'}")
+        print(f"✅ Active sessions: {health_status.get('active_sessions', 0)}")
     except Exception as e:
         print(f"⚠️ Initialization warning: {e}")
     

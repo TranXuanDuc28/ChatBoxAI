@@ -1,11 +1,19 @@
 import google.generativeai as genai
-from langchain.llms.base import LLM
+from langchain_core.language_models.llms import LLM
 from typing import Any, List, Optional, Generator
-from langchain.callbacks.manager import CallbackManagerForLLMRun
-from pydantic import Field
+from langchain_core.callbacks.manager import CallbackManagerForLLMRun
+import pydantic
 import logging
 import time
+from pydantic import Field
 from config.settings import GEMINI_MODEL
+from core.agent.tools import (
+    check_doctor_schedule, 
+    check_doctors_by_specialty, 
+    check_clinic_info,
+    check_packages,
+    check_medicine_info
+)
 
 logger = logging.getLogger("enhanced_medical_chatbot")
 
@@ -25,8 +33,18 @@ class GeminiLLM(LLM):
         **kwargs: Any,
     ) -> str:
         try:
-            model = genai.GenerativeModel(self.model_name)
-            response = model.generate_content(
+            model = genai.GenerativeModel(
+                self.model_name,
+                tools=[
+                    check_doctor_schedule, 
+                    check_doctors_by_specialty, 
+                    check_clinic_info,
+                    check_packages,
+                    check_medicine_info
+                ]
+            )
+            chat = model.start_chat(enable_automatic_function_calling=True)
+            response = chat.send_message(
                 prompt,
                 generation_config=genai.types.GenerationConfig(
                     max_output_tokens=4000,  # ✅ TĂNG LÊN ĐỂ CHO PHÉP PHẢN HỒI DÀI
@@ -51,17 +69,8 @@ class GeminiLLM(LLM):
                 
         except Exception as e:
             logger.error(f"Gemini API error: {e}")
-            error_msg = str(e).lower()
-            
-            # ✅ XỬ LÝ CÁC LOẠI LỖI CỤ THỂ
-            if "safety" in error_msg:
-                return "Xin lỗi, nội dung phản hồi bị giới hạn do chính sách an toàn. Vui lòng hỏi câu khác."
-            elif "quota" in error_msg or "rate" in error_msg:
-                return "Hệ thống đang quá tải. Vui lòng thử lại sau ít phút."
-            elif "timeout" in error_msg:
-                return "Kết nối timeout. Vui lòng thử lại."
-            else:
-                return f"Xin lỗi, tôi đang gặp sự cố kỹ thuật: {str(e)}"
+            # Ném lỗi ra ngoài để cấp cao hơn xử lý fallback
+            raise e
 
 
 class GeminiStreamingLLM(GeminiLLM):
@@ -73,8 +82,11 @@ class GeminiStreamingLLM(GeminiLLM):
             try:
                 logger.info(f"Starting Gemini stream attempt {attempt + 1}/{max_retries}")
                 
-                model = genai.GenerativeModel(self.model_name)
-                response = model.generate_content(
+                model = genai.GenerativeModel(
+                    self.model_name
+                )
+                chat = model.start_chat()
+                response = chat.send_message(
                     prompt,
                     generation_config=genai.types.GenerationConfig(
                         max_output_tokens=4000,  # ✅ TĂNG ĐỂ CHO PHÉP PHẢN HỒI DÀI
@@ -112,7 +124,7 @@ class GeminiStreamingLLM(GeminiLLM):
                         
                         chunk_text = ""
                         
-                        # ✅ XỬ LÝ CHUNK LINH HOẠT HỠN
+                        # ✅ XỬ LÝ CHUNK LINH HOẠT HƠN
                         if hasattr(chunk, 'text') and chunk.text:
                             chunk_text = chunk.text
                         elif hasattr(chunk, 'parts') and chunk.parts:
@@ -160,21 +172,13 @@ class GeminiStreamingLLM(GeminiLLM):
                 error_msg = str(e).lower()
                 logger.error(f"Streaming attempt {attempt + 1} failed: {e}")
                 
-                # ✅ NẾU LÀ LẦN THỬ CUỐI
+                # Nếu là lần thử cuối cùng, ném lỗi ra ngoài để chatbot.py xử lý fallback
                 if attempt == max_retries - 1:
-                    if "safety" in error_msg:
-                        yield "⚠️ Phản hồi bị giới hạn do chính sách an toàn. Vui lòng thử câu hỏi khác."
-                    elif "quota" in error_msg or "rate" in error_msg:
-                        yield "⚠️ Hệ thống đang quá tải. Vui lòng thử lại sau ít phút."
-                    elif "timeout" in error_msg:
-                        yield "⚠️ Kết nối timeout. Vui lòng thử lại."
-                    else:
-                        yield f"❌ Lỗi kỹ thuật: {str(e)}"
-                    return
-                else:
-                    # ✅ THỬ LẠI
-                    yield f"🔄 Lỗi kết nối, đang thử lại lần {attempt + 2}...\n\n"
-                    time.sleep(2)  # Đợi trước khi retry
+                    raise e
+                
+                # Nếu chưa phải lần cuối, log cảnh báo và đợi trước khi thử lại
+                logger.warning(f"Streaming attempt {attempt + 1} failed, retrying... Error: {e}")
+                time.sleep(2)
 
     def test_connection(self) -> dict:
         """Test kết nối với Gemini API."""

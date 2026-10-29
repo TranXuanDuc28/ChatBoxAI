@@ -51,7 +51,7 @@ def register_testing_routes(app):
             if enhanced_chatbot.vector_store.vectorstore is None:
                 return jsonify({"error": "Vector store not initialized"}), 500
             retriever = enhanced_chatbot.vector_store.as_retriever(search_kwargs={"k": 5})
-            docs = retriever.get_relevant_documents(query)
+            docs = retriever.invoke(query)
             results = [
                 {
                     "content": doc.page_content[:200] + "..." if len(doc.page_content) > 200 else doc.page_content,

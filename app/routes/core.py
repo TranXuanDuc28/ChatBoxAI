@@ -26,15 +26,16 @@ def register_core_routes(app):
     def generate_stream_chatbox():
         data = request.json or {}
         question = data.get('text', '')
+        session_id = data.get('session_id') or data.get('sessionId') or 'default_session'
         if not question:
             return jsonify({"error": "Missing question"}), 400
         
         def generate():
             try:
-                yield f"data: {json.dumps({'type': 'start'}, ensure_ascii=False)}\n\n"
-                for content in enhanced_chatbot.generate_streaming_response(question):
+                yield f"data: {json.dumps({'type': 'start', 'session_id': session_id}, ensure_ascii=False)}\n\n"
+                for content in enhanced_chatbot.generate_streaming_response(question, session_id=session_id):
                     yield f"data: {json.dumps({'type': 'chunk', 'content': content}, ensure_ascii=False)}\n\n"
-                    time.sleep(0.05)
+                    time.sleep(0.04)
                 yield f"data: {json.dumps({'type': 'done'}, ensure_ascii=False)}\n\n"
                 yield "data: [DONE]\n\n"
             except Exception as e:
@@ -51,12 +52,13 @@ def register_core_routes(app):
 
     @app.route('/generate_stream_question', methods=['POST'])
     def generate_stream_question():
-        data = request.json
+        data = request.json or {}
         prompt = data.get('prompt', '')
+        session_id = data.get('session_id') or data.get('sessionId') or 'default_session'
         if not prompt:
             return jsonify({"error": "Missing prompt"}), 400
         try:
-            response = enhanced_chatbot.generate_response(prompt)
+            response = enhanced_chatbot.generate_response(prompt, session_id=session_id)
             return Response(
                 json.dumps(response, ensure_ascii=False),  # ✅ giữ nguyên tiếng Việt
                 content_type="application/json; charset=utf-8"
@@ -67,7 +69,7 @@ def register_core_routes(app):
 
     @app.route('/suggestions', methods=['POST'])
     def suggest():
-        data = request.json
+        data = request.json or {}
         partial = data.get('text', '')
         try:
             suggestions = enhanced_chatbot.get_suggestions(partial)
@@ -83,8 +85,36 @@ def register_core_routes(app):
     @app.route('/clear_history', methods=['POST'])
     def clear():
         try:
-            enhanced_chatbot.clear_memory()
-            return jsonify({"message": "Đã xóa lịch sử hội thoại"})
+            data = request.json or {}
+            session_id = data.get('session_id') or data.get('sessionId')
+            enhanced_chatbot.clear_memory(session_id=session_id)
+            return jsonify({"message": "Đã xóa lịch sử hội thoại", "session_id": session_id or "default_session"})
         except Exception as e:
             logger.error(f"Clear history error: {e}")
             return jsonify({"message": "Lỗi khi xóa lịch sử"}), 500
+
+    @app.route('/api/webhook/sync_data', methods=['POST'])
+    @app.route('/refresh_data', methods=['POST'])
+    def sync_data():
+        try:
+            enhanced_chatbot.refresh_data()
+            return jsonify({
+                "status": "success",
+                "message": "Đã làm mới dữ liệu hệ thống thành công",
+                "health": enhanced_chatbot.get_health_status()
+            })
+        except Exception as e:
+            logger.error(f"Sync data error: {e}")
+            return jsonify({"status": "error", "message": str(e)}), 500
+    @app.route('/summarize_history', methods=['POST'])
+    def summarize_history():
+        data = request.json
+        history = data.get('history', [])
+        if not history:
+            return jsonify({"error": "No history data provided"}), 400
+        try:
+            summary = enhanced_chatbot.summarize_medical_history(history)
+            return jsonify({"summary": summary})
+        except Exception as e:
+            logger.error(f"Summarization error: {e}")
+            return jsonify({"error": "Failed to generate summary", "details": str(e)}), 500
