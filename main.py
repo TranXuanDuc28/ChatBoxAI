@@ -2,6 +2,7 @@ import sys
 import io
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
+# Auto-reload trigger: 4096 tokens
 from app import create_app
 from utils.logging import setup_logging
 from core.chatbot import enhanced_chatbot
@@ -66,4 +67,4 @@ if __name__ == '__main__':
     print("\n💡 Press Ctrl+C to stop server")
     print("=" * 50)
     
-    app.run(host='0.0.0.0', port=5002, debug=True)
+    app.run(host='0.0.0.0', port=5002, debug=False)

@@ -35,7 +35,8 @@ class WebDataManager:
             "handbooks": [],
             "packages": [],
             "facilities": [],
-            "medicines": []
+            "medicines": [],
+            "provinces": []
         }
 
         # 1. Các API danh mục cơ bản
@@ -45,7 +46,8 @@ class WebDataManager:
             ("handbooks", f"{BACKEND_API_BASE}/get-handbook?lang={BACKEND_LANG}"),
             ("packages", f"{BACKEND_API_BASE}/packages/all"),
             ("facilities", f"{BACKEND_API_BASE}/facilities/all"),
-            ("medicines", f"{BACKEND_API_BASE}/get-medicines")
+            ("medicines", f"{BACKEND_API_BASE}/get-medicines"),
+            ("provinces", f"{BACKEND_API_BASE}/allcode?type=PROVINCE")
         ]
 
         for data_type, url in apis_to_call:
@@ -83,19 +85,19 @@ class WebDataManager:
 
                     # Chuẩn bị dữ liệu lịch khám 7 ngày liên tiếp
                     today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-                    day_names = ["Thứ 2", "Thứ 3", "Thứ 4", "Thứ 5", "Thứ 6", "Thứ 7", "Chủ nhật"]
+                    day_names = ["Thứ Hai", "Thứ Ba", "Thứ Tư", "Thứ Năm", "Thứ Sáu", "Thứ Bảy", "Chủ Nhật"]
                     days_to_check = []
                     for i in range(7):
                         target_day = today + timedelta(days=i)
                         target_ts = int(target_day.timestamp() * 1000)
+                        weekday_name = day_names[target_day.weekday()]
                         if i == 0:
-                            label = "Hôm nay"
+                            label = f"Hôm nay ({weekday_name}, {target_day.strftime('%d/%m')})"
                         elif i == 1:
-                            label = "Ngày mai"
+                            label = f"Ngày mai ({weekday_name}, {target_day.strftime('%d/%m')})"
                         else:
-                            weekday_name = day_names[target_day.weekday()]
                             label = f"{weekday_name} ({target_day.strftime('%d/%m')})"
-                        days_to_check.append((label, target_ts))
+                        days_to_check.append((label, target_ts, target_day))
 
                     def fetch_single_doctor_data(doctor):
                         try:
@@ -113,9 +115,9 @@ class WebDataManager:
                                     doctor_detail = det_data.get("data", {})
                                     doctor_detail.pop("image", None)
 
-                            # 2. Lịch khám trong 7 ngày tới
+                            # 2. Lịch khám trong 7 ngày tới (ghi nhận rõ ràng từng ngày: có lịch hay chưa có lịch)
                             schedules = []
-                            for label, ts in days_to_check:
+                            for label, ts, target_day in days_to_check:
                                 try:
                                     sch_url = f"{BACKEND_API_BASE}/get_schedule_doctor_by_date?doctorId={doc_id}&date={ts}"
                                     sch_resp = requests.get(sch_url, timeout=3)
@@ -125,9 +127,15 @@ class WebDataManager:
                                             slots = [s.get("timeTypeData", {}).get("valueVi", "") for s in sch_json.get("data", [])]
                                             slots = [sl for sl in slots if sl]
                                             if slots:
-                                                schedules.append(f"{label}: {', '.join(slots)}")
+                                                schedules.append(f"- {label}: {', '.join(slots)} (Có lịch)")
+                                            else:
+                                                schedules.append(f"- {label}: Chưa có lịch khám trực tuyến")
+                                        else:
+                                            schedules.append(f"- {label}: Chưa có lịch khám trực tuyến")
+                                    else:
+                                        schedules.append(f"- {label}: Chưa có lịch khám trực tuyến")
                                 except Exception:
-                                    pass
+                                    schedules.append(f"- {label}: Chưa có lịch khám trực tuyến")
 
                             first_name = doctor.get("firstName", "")
                             last_name = doctor.get("lastName", "")

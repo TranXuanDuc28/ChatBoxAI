@@ -55,6 +55,50 @@ class SessionMemoryManager:
         memory = self.get_memory(session_id)
         memory.chat_memory.add_ai_message(message)
 
+    def set_location(self, session_id: Optional[str], location: str, province: Optional[str] = None, district: Optional[str] = None):
+        """Lưu địa điểm, tỉnh thành và quận huyện của người dùng vào phiên."""
+        sid = session_id.strip() if session_id and session_id.strip() else "default_session"
+        self.get_memory(sid)
+        if location and location.strip():
+            self.sessions[sid]["location"] = location.strip()
+            if province:
+                self.sessions[sid]["province"] = province.strip()
+            if district:
+                self.sessions[sid]["district"] = district.strip()
+            logger.info(f"Updated location for session '{sid}': {location.strip()} (prov={province}, dist={district})")
+
+    def get_location(self, session_id: Optional[str]) -> Optional[str]:
+        """Lấy chuỗi hiển thị địa điểm hiện tại của phiên."""
+        sid = session_id.strip() if session_id and session_id.strip() else "default_session"
+        if sid in self.sessions:
+            return self.sessions[sid].get("location")
+        return None
+
+    def get_location_details(self, session_id: Optional[str]):
+        """Lấy chi tiết (location, province, district) của phiên."""
+        sid = session_id.strip() if session_id and session_id.strip() else "default_session"
+        if sid in self.sessions:
+            return (
+                self.sessions[sid].get("location"),
+                self.sessions[sid].get("province"),
+                self.sessions[sid].get("district")
+            )
+        return (None, None, None)
+
+    def set_last_doctor(self, session_id: Optional[str], doctor_info: Dict):
+        """Lưu bác sĩ đang được trao đổi gần nhất trong phiên."""
+        sid = session_id.strip() if session_id and session_id.strip() else "default_session"
+        self.get_memory(sid)
+        self.sessions[sid]["last_doctor"] = doctor_info
+        logger.info(f"Updated last_doctor for session '{sid}': {doctor_info.get('name', 'N/A')}")
+
+    def get_last_doctor(self, session_id: Optional[str]) -> Optional[Dict]:
+        """Lấy thông tin bác sĩ đang được trao đổi gần nhất trong phiên."""
+        sid = session_id.strip() if session_id and session_id.strip() else "default_session"
+        if sid in self.sessions:
+            return self.sessions[sid].get("last_doctor")
+        return None
+
     def clear_session(self, session_id: Optional[str]):
         sid = session_id.strip() if session_id and session_id.strip() else "default_session"
         if sid in self.sessions:

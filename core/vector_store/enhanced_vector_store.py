@@ -242,6 +242,7 @@ class EnhancedVectorStore:
             name = f"{first_name} {last_name}".strip()
             specialty_name = doctor.get("specialty", "N/A")
             clinic_name = doctor.get("clinic", "N/A")
+            address_clinic = doctor.get("addressClinic", "")
             note = doctor.get("note", "")
             price = doctor.get("price", "")
             payment = doctor.get("payment", "")
@@ -254,14 +255,19 @@ class EnhancedVectorStore:
                 if schedules:
                     schedule_info = "\n" + "\n".join(schedules)
 
+                doc_id = doctor.get('id')
+                booking_url = f"/detail-doctor/{doc_id}" if doc_id else ""
+
                 # Tạo text phong phú và lặp lại tên bác sĩ để tăng trọng số tìm kiếm
-                doctor_text = f"""Bác sĩ {name} chuyên khoa {specialty_name} tại {clinic_name} ({province}).
+                doctor_text = f"""Bác sĩ {name} (ID: {doc_id}) chuyên khoa {specialty_name} tại {clinic_name} ({province}).
+Địa chỉ phòng khám / bệnh viện: {address_clinic if address_clinic else province}.
 Giá khám: {price}. Thanh toán: {payment}.
 Số điện thoại liên hệ: {doctor.get('phoneNumber', 'N/A')}.
-Lịch khám của bác sĩ:
+Link đặt lịch trực tuyến trên website: {booking_url}
+Lịch khám chi tiết 7 ngày tới của bác sĩ:
 {schedule_info if schedule_info else 'Hiện tại chưa cập nhật lịch khám trực tuyến trên hệ thống. Vui lòng liên hệ phòng khám để biết chi tiết lịch khám cụ thể.'}
 Ghi chú: {note[:200]}
-Từ khóa: {name}, bác sĩ {name}, số điện thoại {name}, liên hệ {name}, lịch khám {name}, khung giờ {name}, {specialty_name}"""
+Từ khóa: {name}, bác sĩ {name}, số điện thoại {name}, liên hệ {name}, lịch khám {name}, lịch khám ngày mai {name}, lịch khám hôm nay {name}, khung giờ {name}, {specialty_name}, {address_clinic}"""
 
                 # Tìm keywords liên quan từ chuyên khoa
                 specialty_keywords = []
@@ -278,6 +284,8 @@ Từ khóa: {name}, bác sĩ {name}, số điện thoại {name}, liên hệ {na
                         "specialty_keywords": specialty_keywords,
                         "clinic_name": clinic_name,
                         "province": province,
+                        "addressClinic": address_clinic,
+                        "address": address_clinic,
                         "data": doctor_copy
                     }
                 ))
@@ -295,14 +303,17 @@ Từ khóa: {name}, bác sĩ {name}, số điện thoại {name}, liên hệ {na
             if isinstance(clinic_data, dict):
                 name = clinic_data.get("name", "").strip()
                 description = clinic_data.get("description", "").strip()
+                address = clinic_data.get("address", "").strip()
                 if name or description:
-                    text = f"Bệnh viện {name}\n{description}".strip()
+                    text = f"Bệnh viện {name}\nĐịa chỉ: {address}\n{description}".strip()
                     data_copy = {k: v for k, v in clinic_data.items() if k != "image"}
                     documents.append(Document(
                         page_content=text, 
                         metadata={
                             "type": "clinic", 
                             "clinic_name": name,
+                            "address": address,
+                            "province": address,
                             "data": data_copy
                         }
                     ))
@@ -314,13 +325,16 @@ Từ khóa: {name}, bác sĩ {name}, số điện thoại {name}, liên hệ {na
                 content = clinic_md.get("contentMarkdown", clinic_md.get("contentHTML", "")).strip()
                 if content:
                     clinic_name = clinic.get('name', clinic_data.get('name', 'N/A') if clinic_data else 'N/A')
-                    text = f"Bệnh viện {clinic_name}\n{content}".strip()
+                    address = clinic_data.get('address', '') if clinic_data else ''
+                    text = f"Bệnh viện {clinic_name}\nĐịa chỉ: {address}\n{content}".strip()
                     md_copy = {k: v for k, v in clinic_md.items() if k != "image"}
                     documents.append(Document(
                         page_content=text, 
                         metadata={
                             "type": "clinic_detail", 
                             "clinic_name": clinic_name,
+                            "address": address,
+                            "province": address,
                             "data": md_copy
                         }
                     ))
@@ -506,11 +520,11 @@ Từ khóa: thuốc {name}, tác dụng thuốc {name}, giá {name}, đơn vị 
             return None
         return self.vectorstore.as_retriever(**kwargs)
 
-    def hybrid_search_with_rerank(self, query: str, k: int = 5) -> List[Document]:
+    def hybrid_search_with_rerank(self, query: str, k: int = 5, target_province: Optional[str] = None, target_district: Optional[str] = None) -> List[Document]:
         """
         Tìm kiếm lai (Hybrid Search) kết hợp Dense Vector Search (Qdrant/FAISS) 
         và Sparse Keyword Search (BM25), sau đó chạy một bước Rerank để tăng trọng số
-        các tài liệu có từ khóa trùng khớp trực tiếp.
+        các tài liệu có từ khóa trùng khớp trực tiếp hoặc cùng tỉnh thành/quận huyện với người dùng.
         """
         if self.vectorstore is None:
             logger.warning("⚠️ Vector store not initialized. Cannot perform search.")
@@ -561,6 +575,41 @@ Từ khóa: thuốc {name}, tác dụng thuốc {name}, giá {name}, đơn vị 
         for doc in candidates:
             doc_type = doc.metadata.get("type", "")
             boost_score = 0.0
+
+            # Lấy toàn bộ thông tin địa chỉ của tài liệu
+            doc_addr_full = (
+                str(doc.metadata.get("province", "")) + " " + 
+                str(doc.metadata.get("address", "")) + " " + 
+                str(doc.metadata.get("addressClinic", "")) + " " + 
+                str(doc.metadata.get("data", {}).get("province", "")) + " " + 
+                str(doc.metadata.get("data", {}).get("addressClinic", "")) + " " + 
+                str(doc.metadata.get("data", {}).get("address", ""))
+            ).lower()
+
+            # Boost mạnh nếu cơ sở/bác sĩ cùng tỉnh thành với người dùng (+4.0)
+            if target_province:
+                t_prov = target_province.lower()
+                prov_match = False
+                if any(x in t_prov for x in ["hồ chí minh", "sài gòn", "hcm"]):
+                    prov_match = any(alias in doc_addr_full for alias in ["hồ chí minh", "ho chi minh", "hcm", "tp. hcm", "sài gòn"])
+                else:
+                    prov_match = t_prov in doc_addr_full
+
+                if prov_match:
+                    boost_score += 4.0
+
+            # Boost vượt trội nếu khớp đúng Quận / Huyện (+3.5)
+            if target_district:
+                t_dist = target_district.lower()
+                dist_match = False
+                if t_dist.startswith("quận "):
+                    q_num = t_dist.replace("quận ", "").strip()
+                    dist_match = any(pat in doc_addr_full for pat in [t_dist, f"q.{q_num}", f"q{q_num}", f"district {q_num}"])
+                else:
+                    dist_match = t_dist in doc_addr_full or t_dist in doc.page_content.lower()
+
+                if dist_match:
+                    boost_score += 3.5
 
             # Boost bác sĩ nếu khớp tên
             if doc_type == "doctor":

@@ -10,7 +10,8 @@ def register_core_routes(app):
     @app.route('/load_model', methods=['POST'])
     def load_model():
         try:
-            enhanced_chatbot.refresh_data()
+            if not enhanced_chatbot.vector_store or not enhanced_chatbot.vector_store.vectorstore:
+                enhanced_chatbot.refresh_data()
             return jsonify({
                 "message": "Enhanced Medical Chatbot với LangChain đã sẵn sàng",
                 "model": enhanced_chatbot.llm.model_name,
@@ -25,15 +26,16 @@ def register_core_routes(app):
     @app.route('/generate_stream_chatbox', methods=['POST'])
     def generate_stream_chatbox():
         data = request.json or {}
-        question = data.get('text', '')
+        question = data.get('text') or data.get('message') or data.get('question') or ''
         session_id = data.get('session_id') or data.get('sessionId') or 'default_session'
+        location = data.get('location') or data.get('user_location') or data.get('province')
         if not question:
             return jsonify({"error": "Missing question"}), 400
         
         def generate():
             try:
                 yield f"data: {json.dumps({'type': 'start', 'session_id': session_id}, ensure_ascii=False)}\n\n"
-                for content in enhanced_chatbot.generate_streaming_response(question, session_id=session_id):
+                for content in enhanced_chatbot.generate_streaming_response(question, session_id=session_id, location=location):
                     yield f"data: {json.dumps({'type': 'chunk', 'content': content}, ensure_ascii=False)}\n\n"
                     time.sleep(0.04)
                 yield f"data: {json.dumps({'type': 'done'}, ensure_ascii=False)}\n\n"
@@ -53,12 +55,13 @@ def register_core_routes(app):
     @app.route('/generate_stream_question', methods=['POST'])
     def generate_stream_question():
         data = request.json or {}
-        prompt = data.get('prompt', '')
+        prompt = data.get('prompt') or data.get('text') or data.get('message') or data.get('question') or ''
         session_id = data.get('session_id') or data.get('sessionId') or 'default_session'
+        location = data.get('location') or data.get('user_location') or data.get('province')
         if not prompt:
             return jsonify({"error": "Missing prompt"}), 400
         try:
-            response = enhanced_chatbot.generate_response(prompt, session_id=session_id)
+            response = enhanced_chatbot.generate_response(prompt, session_id=session_id, location=location)
             return Response(
                 json.dumps(response, ensure_ascii=False),  # ✅ giữ nguyên tiếng Việt
                 content_type="application/json; charset=utf-8"

@@ -1,14 +1,18 @@
-from core.llm.gemini import GeminiLLM, GeminiStreamingLLM
-from core.classifier.medical_classifier import MedicalClassifier
-from core.vector_store.enhanced_vector_store import EnhancedVectorStore
-from core.vector_store.embeddings import SentenceTransformerEmbeddings
-from core.data.web_data_manager import WebDataManager
-from core.memory.session_manager import SessionMemoryManager
-from config.prompts import MEDICAL_SYSTEM_PROMPT
-import logging
-from config.settings import GEMINI_API_KEY, GEMINI_MODEL
-from typing import Dict, List, Optional, Tuple
 import json
+import logging
+import re
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple
+from config.prompts import MEDICAL_SYSTEM_PROMPT
+from config.settings import GEMINI_API_KEY, GEMINI_MODEL
+from core.classifier.medical_classifier import MedicalClassifier
+from core.data.web_data_manager import WebDataManager
+from core.llm.gemini import GeminiLLM, GeminiStreamingLLM
+from core.memory.session_manager import SessionMemoryManager
+from core.vector_store.embeddings import SentenceTransformerEmbeddings
+from core.vector_store.enhanced_vector_store import EnhancedVectorStore
+from utils.geo_helper import GeographicResolver, default_geo_resolver
+
 logger = logging.getLogger("enhanced_medical_chatbot")
 
 class EnhancedMedicalChatbot:
@@ -26,19 +30,40 @@ class EnhancedMedicalChatbot:
         web_data = self.web_data_manager.get_web_data()
         self.vector_store.build_from_web_data(web_data)
         
-        # Tự động trích xuất danh sách tỉnh thành và chuyên khoa từ dữ liệu hệ thống
+        # 1. Tự động nạp động Tỉnh/Thành phố từ Database (Allcodes + Doctors + Clinics + Facilities)
         doctors = web_data.get("doctors", [])
-        
-        # 1. Tỉnh thành
         provinces_set = set()
+        for prov_item in web_data.get("provinces", []):
+            if isinstance(prov_item, dict):
+                p_val = prov_item.get("valueVi") or prov_item.get("valueEn")
+                if p_val and p_val != "N/A":
+                    provinces_set.add(p_val.strip())
         for doc in doctors:
             prov = doc.get("province")
             if prov and prov != "N/A":
                 provinces_set.add(prov.strip())
+        for cl in web_data.get("clinics", []):
+            cl_data = cl.get("clinicData", {})
+            if isinstance(cl_data, dict):
+                addr = cl_data.get("address", "")
+                if addr:
+                    _, p_match, _ = default_geo_resolver.resolve_location(addr)
+                    if p_match:
+                        provinces_set.add(p_match)
+        for fac in web_data.get("facilities", []):
+            addr = fac.get("address", "")
+            if addr:
+                _, p_match, _ = default_geo_resolver.resolve_location(addr)
+                if p_match:
+                    provinces_set.add(p_match)
+
         self.provinces = list(provinces_set)
         if not self.provinces:
             self.provinces = ["Hà Nội", "Hồ Chí Minh", "Đà Nẵng"]
-        logger.info(f"Automatically loaded {len(self.provinces)} provinces from database: {self.provinces}")
+        
+        # Khởi tạo Dynamic Geo Resolver với các tỉnh nạp động từ DB + 63 tỉnh toàn quốc + mốc địa danh
+        self.geo_resolver = GeographicResolver(db_provinces=self.provinces)
+        logger.info(f"Automatically loaded {len(self.provinces)} dynamic provinces from database: {self.provinces}")
         
         # 2. Chuyên khoa
         specialties_set = set()
@@ -74,6 +99,20 @@ class EnhancedMedicalChatbot:
             "active_sessions": len(self.session_manager.sessions),
             "api_key_configured": bool(GEMINI_API_KEY)
         }
+
+    def _is_obviously_medical(self, text: str) -> bool:
+        """Kiểm tra xem câu hỏi có chứa từ ngữ y tế, triệu chứng, phòng khám, bác sĩ hoặc đặt lịch kể cả khi gõ không dấu."""
+        from utils.geo_helper import remove_diacritics
+        norm = remove_diacritics(text.lower())
+        medical_keywords = [
+            "kham", "bac si", "bs", "benh", "thuoc", "dau", "sot", "viem", "ho", "kho tho",
+            "ung thu", "chuyen khoa", "phong kham", "benh vien", "dat lich", "gia kham",
+            "chi phi", "tu van", "suc khoe", "xet nghiem", "sieu am", "chup", "chan thuong",
+            "gay xuong", "moi met", "chong mat", "buon non", "nhiem trung", "dieu tri",
+            "tai mui hong", "tim mach", "da lieu", "nha khoa", "san phu khoa", "noi tiet",
+            "co xuong khop", "than kinh", "tieu hoa", "tiet nieu", "nam hoc", "nhi khoa"
+        ]
+        return any(kw in norm for kw in medical_keywords)
 
     def check_emergency(self, message: str) -> Optional[str]:
         """Kiểm tra dấu hiệu cấp cứu đỏ (Red Flags) để cảnh báo khẩn cấp ngay lập tức."""
@@ -113,13 +152,18 @@ class EnhancedMedicalChatbot:
                 "Bạn đang có thắc mắc gì về sức khỏe hoặc cần hỗ trợ đặt lịch khám chuyên khoa nào, hãy chia sẻ cùng tôi nhé!"
             )
         return None
-    def get_smart_context(self, user_message: str) -> str:
-        """Lấy ngữ cảnh thông minh bằng Hybrid Search và Reranking."""
+    def get_smart_context(self, user_message: str, target_province: Optional[str] = None, target_district: Optional[str] = None) -> str:
+        """Lấy ngữ cảnh thông minh bằng Hybrid Search và Reranking với location boosting (Tỉnh thành & Quận huyện)."""
         if self.vector_store.vectorstore is None:
             return "Không có thông tin bổ sung"
         
         try:
-            docs = self.vector_store.hybrid_search_with_rerank(user_message, k=10)
+            docs = self.vector_store.hybrid_search_with_rerank(
+                user_message, 
+                k=10, 
+                target_province=target_province,
+                target_district=target_district
+            )
             return "\n".join([doc.page_content for doc in docs])
         except Exception as e:
             logger.warning(f"Smart context error: {e}")
@@ -179,29 +223,31 @@ class EnhancedMedicalChatbot:
         return "\n".join([doc.page_content for doc in unique_docs[:15]])
 
     def _extract_symptom_keywords(self, message: str) -> List[str]:
-        """Trích xuất từ khóa triệu chứng để tìm chuyên khoa phù hợp."""
-        symptom_mapping = {
-            "tim": ["tim", "trái tim", "nhịp tim", "đau ngực"],
-            "gan": ["gan", "mật", "vàng da", "đau bụng phải"],
-            "thần kinh": ["đầu", "não", "thần kinh", "tê liệt", "chóng mặt"],
-            "mắt": ["mắt", "mờ", "nhìn", "thị lực"],
-            "tai mũi họng": ["tai", "mũi", "họng", "nghe", "nuốt"],
-            "da": ["da", "ngứa", "nổi mẩn", "dị ứng"],
-            "xương khớp": ["xương", "khớp", "đau lưng", "cột sống"],
-            "nhi": ["trẻ em", "em bé", "con", "trẻ"],
-            "sản phụ": ["mang thai", "sinh con", "phụ khoa", "kinh nguyệt"]
-        }
-        
-        message_lower = message.lower()
+        """
+        Trích xuất chuyên khoa và triệu chứng theo Semantic Vector Search động 
+        thay vì dựa vào từ điển hardcode tĩnh.
+        """
         keywords = []
-        
-        for specialty, symptoms in symptom_mapping.items():
-            for symptom in symptoms:
-                if symptom in message_lower:
-                    keywords.append(specialty)
-                    break
-        
-        return list(set(keywords))
+        msg_lower = message.lower()
+
+        # 1. Kiểm tra trực tiếp các chuyên khoa hiện có trong Database
+        if hasattr(self, 'specialties') and self.specialties:
+            for spec in self.specialties:
+                if spec.lower() in msg_lower:
+                    keywords.append(spec)
+
+        # 2. Sử dụng Dense Vector Search để tìm chuyên khoa tương đồng ngữ nghĩa nhất
+        if hasattr(self, 'vector_store') and self.vector_store and self.vector_store.vectorstore:
+            try:
+                sim_docs = self.vector_store.vectorstore.similarity_search(message, k=4)
+                for doc in sim_docs:
+                    s_name = doc.metadata.get("specialty_name")
+                    if s_name and s_name not in keywords:
+                        keywords.append(s_name)
+            except Exception as e:
+                logger.warning(f"Semantic specialty extraction error: {e}")
+
+        return keywords[:3]
 
     def _get_general_context(self, user_message: str) -> str:
         """Lấy ngữ cảnh thông thường."""
@@ -259,10 +305,89 @@ class EnhancedMedicalChatbot:
             
         return "Xin lỗi, AI đang bận và tôi không tìm thấy dữ liệu phù hợp trong chế độ dự phòng. Bạn vui lòng thử lại sau vài phút."
 
-    # Cập nhật phương thức generate_response để sử dụng smart context, multi-session và fallback
-    def generate_response(self, user_message: str, session_id: Optional[str] = "default_session") -> str:
+    def _clean_response_links(self, response_text: str) -> str:
+        """Đảm bảo mọi link đặt lịch đều là đường dẫn tương đối chuẩn /detail-doctor/{id} và loại bỏ tàn dư thừa."""
+        if not response_text:
+            return response_text
+        cleaned = re.sub(r'https?://localhost:\d+/detail-doctor/', '/detail-doctor/', response_text)
+        cleaned = re.sub(r'https?://127\.0\.0\.1:\d+/detail-doctor/', '/detail-doctor/', cleaned)
+        # Loại bỏ các tàn dư lửng lơ như "Khi bấm vào..." ở cuối câu
+        cleaned = re.sub(r'\n+\s*Khi bấm vào(?:\s+link[^\n]*)?$', '', cleaned, flags=re.IGNORECASE)
+        return cleaned.strip()
+
+    def _enrich_context_with_doctor_schedule(self, user_message: str, chat_history: str, session_id: str, base_context: str) -> str:
         """
-        Tạo phản hồi không streaming với ngữ cảnh thông minh và quản lý phiên độc lập.
+        Phát hiện nếu người dùng đang hỏi về lịch khám, ngày giờ, ca khám hoặc follow-up về một bác sĩ,
+        tự động tìm thông tin chi tiết và bảng lịch 7 ngày của bác sĩ đó để đưa trực tiếp lên đầu ngữ cảnh.
+        """
+        web_data = self.web_data_manager.get_web_data()
+        all_doctors = web_data.get("doctors", [])
+        if not all_doctors:
+            return base_context
+
+        msg_lower = user_message.lower()
+        history_lower = chat_history.lower() if chat_history else ""
+
+        # 1. Tìm xem bác sĩ nào được nhắc đến trực tiếp trong câu hỏi
+        matched_doctor = None
+        for doc in all_doctors:
+            d_name = doc.get("name", "").lower()
+            d_last = doc.get("lastName", "").lower()
+            if (d_name and d_name in msg_lower) or (d_last and len(d_last) > 2 and d_last in msg_lower):
+                matched_doctor = doc
+                break
+
+        # 2. Nếu không có tên trực tiếp trong câu hỏi, kiểm tra xem có phải câu hỏi follow-up (lịch/giờ/mai/hôm nay/giá/bác sĩ)
+        schedule_keywords = ["lịch", "khám", "mai", "hôm nay", "giờ", "mấy giờ", "thứ", "trống", "cụ thể", "chi phí", "giá", "bác sĩ"]
+        is_followup = any(kw in msg_lower for kw in schedule_keywords)
+
+        if not matched_doctor and is_followup:
+            # Kiểm tra doctor đã lưu trong session
+            last_doc = self.session_manager.get_last_doctor(session_id)
+            if last_doc:
+                for doc in all_doctors:
+                    if doc.get("id") == last_doc.get("id"):
+                        matched_doctor = doc
+                        break
+
+            # Nếu chưa có trong session, quét ngược trong lịch sử hội thoại gần nhất
+            if not matched_doctor and history_lower:
+                for doc in all_doctors:
+                    d_name = doc.get("name", "").lower()
+                    d_last = doc.get("lastName", "").lower()
+                    if (d_name and d_name in history_lower) or (d_last and len(d_last) > 2 and d_last in history_lower):
+                        matched_doctor = doc
+                        break
+
+        # 3. Nếu tìm thấy bác sĩ liên quan, lưu vào session và inject khối thông tin lịch khám ưu tiên
+        if matched_doctor:
+            self.session_manager.set_last_doctor(session_id, matched_doctor)
+            schedules_list = matched_doctor.get("schedules", [])
+            schedules_str = "\n".join(schedules_list) if schedules_list else "Hiện tại chưa cập nhật lịch khám trực tuyến trong 7 ngày tới."
+            doc_id = matched_doctor.get('id')
+            booking_link = f"/detail-doctor/{doc_id}" if doc_id else ""
+
+            doctor_schedule_block = f"""
+================================================================================
+THÔNG TIN LỊCH KHÁM THỜI GIAN THỰC CỦA BÁC SĨ (ƯU TIÊN TUYỆT ĐỐI):
+👨‍⚕️ Bác sĩ: {matched_doctor.get('name')} (ID: {doc_id})
+🏥 Chuyên khoa: {matched_doctor.get('specialty')}
+🏢 Phòng khám / Cơ sở: {matched_doctor.get('clinic')} (Địa chỉ: {matched_doctor.get('addressClinic', matched_doctor.get('province', ''))})
+💰 Giá khám: {matched_doctor.get('price')}
+🔗 Link đặt lịch chính thức: 👉 [Bấm vào đây để chọn ngày & giờ khám với Bác sĩ {matched_doctor.get('name')}]( {booking_link} )
+
+📅 BẢNG LỊCH KHÁM 7 NGÀY TỚI THEO THỜI GIAN THỰC (ĐỐI CHIẾU CHÍNH XÁC):
+{schedules_str}
+================================================================================
+"""
+            return doctor_schedule_block + "\n\n" + base_context
+
+        return base_context
+
+    # Cập nhật phương thức generate_response để sử dụng smart context, multi-session và fallback
+    def generate_response(self, user_message: str, session_id: Optional[str] = "default_session", location: Optional[str] = None) -> str:
+        """
+        Tạo phản hồi không streaming với ngữ cảnh thông minh, quản lý phiên và nhận diện vị trí.
         """
         try:
             # 1. Kiểm tra trường hợp cấp cứu khẩn cấp (Red Flags)
@@ -279,33 +404,74 @@ class EnhancedMedicalChatbot:
                 self.session_manager.add_ai_message(session_id, greeting_resp)
                 return greeting_resp
 
-            # 3. Sử dụng PhoBERT để kiểm duyệt nếu câu hỏi hoàn toàn phi y tế
-            if hasattr(self, 'medical_classifier') and self.medical_classifier:
+            # Lấy lịch sử trò chuyện theo đúng phiên
+            chat_history = self.session_manager.get_chat_history_str(session_id)
+            has_history = bool(chat_history and chat_history.strip())
+
+            # 3. Sử dụng PhoBERT để kiểm duyệt nếu câu hỏi hoàn toàn phi y tế (chỉ kiểm duyệt câu mở đầu)
+            if not has_history and hasattr(self, 'medical_classifier') and self.medical_classifier:
                 try:
                     is_med, conf = self.medical_classifier.is_medical_question(user_message)
                     if not is_med and conf > 0.85:
-                        out_of_scope = (
-                            "Xin lỗi bạn, tôi là Trợ lý Y tế Thông minh và chỉ được đào tạo chuyên sâu về "
-                            "lĩnh vực y tế, sức khỏe, bác sĩ và đặt lịch khám bệnh. Tôi không thể hỗ trợ các chủ đề ngoài y tế.\n\n"
-                            "Nếu bạn có bất kỳ câu hỏi nào về sức khỏe, triệu chứng bệnh hoặc cần tìm bác sĩ/gói khám, "
-                            "xin vui lòng hỏi tôi nhé!"
-                        )
-                        self.session_manager.add_user_message(session_id, user_message)
-                        self.session_manager.add_ai_message(session_id, out_of_scope)
-                        return out_of_scope
+                        if not self._is_obviously_medical(user_message):
+                            out_of_scope = (
+                                "Xin lỗi bạn, tôi là Trợ lý Y tế Thông minh và chỉ được đào tạo chuyên sâu về "
+                                "lĩnh vực y tế, sức khỏe, bác sĩ và đặt lịch khám bệnh. Tôi không thể hỗ trợ các chủ đề ngoài y tế.\n\n"
+                                "Nếu bạn có bất kỳ câu hỏi nào về sức khỏe, triệu chứng bệnh hoặc cần tìm bác sĩ/gói khám, "
+                                "xin vui lòng hỏi tôi nhé!"
+                            )
+                            self.session_manager.add_user_message(session_id, user_message)
+                            self.session_manager.add_ai_message(session_id, out_of_scope)
+                            return out_of_scope
+                        else:
+                            logger.info(f"PhoBERT flagged non-medical, but medical indicator matched. Proceeding with query.")
                 except Exception as cf_err:
                     logger.warning(f"Classification check skipped: {cf_err}")
 
-            # 4. Lấy ngữ cảnh thông minh
-            context = self.get_smart_context(user_message)
-            
-            # 5. Lấy lịch sử trò chuyện theo đúng phiên
-            chat_history = self.session_manager.get_chat_history_str(session_id)
+            # Xử lý nhận diện và ghi nhớ vị trí (Location Intelligence: District & Province)
+            active_loc_display = None
+            active_province = None
+            active_district = None
+
+            if location and isinstance(location, str) and location.strip():
+                f_disp, f_prov, f_dist = self._detect_location_details(location)
+                active_loc_display = f_disp or location.strip()
+                active_province = f_prov
+                active_district = f_dist
+                self.session_manager.set_location(session_id, active_loc_display, active_province, active_district)
+
+            msg_disp, msg_prov, msg_dist = self._detect_location_details(user_message)
+            if msg_disp or msg_prov or msg_dist:
+                active_loc_display = msg_disp or active_loc_display
+                active_province = msg_prov or active_province
+                active_district = msg_dist or active_district
+                self.session_manager.set_location(session_id, active_loc_display, active_province, active_district)
+
+            if not active_loc_display:
+                active_loc_display, active_province, active_district = self.session_manager.get_location_details(session_id)
+
+            location_desc = active_loc_display if active_loc_display else "Chưa rõ vị trí (Cần hỏi người bệnh quận/huyện, tỉnh/thành phố để gợi ý bác sĩ gần nhất)"
+
+            # 4. Lấy ngữ cảnh thông minh có ưu tiên vị trí và quận/huyện
+            context = self.get_smart_context(user_message, target_province=active_province, target_district=active_district)
+            context = self._enrich_context_with_doctor_schedule(user_message, chat_history, session_id, context)
+
+            now = datetime.now()
+            day_names = ["Thứ Hai", "Thứ Ba", "Thứ Tư", "Thứ Năm", "Thứ Sáu", "Thứ Bảy", "Chủ Nhật"]
+            today_weekday = day_names[now.weekday()]
+            tomorrow = now + timedelta(days=1)
+            tomorrow_weekday = day_names[tomorrow.weekday()]
+
+            current_date_str = f"{today_weekday}, ngày {now.strftime('%d/%m/%Y')}"
+            tomorrow_date_str = f"{tomorrow_weekday}, ngày {tomorrow.strftime('%d/%m/%Y')}"
 
             # 6. Tạo prompt với MEDICAL_SYSTEM_PROMPT
             prompt = MEDICAL_SYSTEM_PROMPT.format(
+                current_date_str=current_date_str,
+                tomorrow_date_str=tomorrow_date_str,
                 context=context,
                 chat_history=chat_history,
+                patient_location=location_desc,
                 question=user_message
             )
 
@@ -317,6 +483,8 @@ class EnhancedMedicalChatbot:
                 response = response.content
             else:
                 response = str(response)
+
+            response = self._clean_response_links(response)
 
             # Cập nhật bộ nhớ trò chuyện của phiên
             try:
@@ -333,9 +501,9 @@ class EnhancedMedicalChatbot:
             self.session_manager.add_ai_message(session_id, fallback_res)
             return fallback_res
 
-    def generate_streaming_response(self, user_message: str, session_id: Optional[str] = "default_session"):
+    def generate_streaming_response(self, user_message: str, session_id: Optional[str] = "default_session", location: Optional[str] = None):
         """
-        Tạo phản hồi streaming với ngữ cảnh thông minh và quản lý phiên độc lập.
+        Tạo phản hồi streaming với ngữ cảnh thông minh, quản lý phiên và nhận diện vị trí.
         """
         try:
             # 1. Kiểm tra trường hợp cấp cứu khẩn cấp (Red Flags)
@@ -354,43 +522,87 @@ class EnhancedMedicalChatbot:
                 self.session_manager.add_ai_message(session_id, greeting_resp)
                 return
 
-            # 3. Sử dụng PhoBERT để kiểm duyệt nếu câu hỏi hoàn toàn phi y tế
-            if hasattr(self, 'medical_classifier') and self.medical_classifier:
+            # Lấy lịch sử trò chuyện theo đúng phiên
+            chat_history = self.session_manager.get_chat_history_str(session_id)
+            has_history = bool(chat_history and chat_history.strip())
+
+            # 3. Sử dụng PhoBERT để kiểm duyệt nếu câu hỏi hoàn toàn phi y tế (chỉ kiểm duyệt câu mở đầu)
+            if not has_history and hasattr(self, 'medical_classifier') and self.medical_classifier:
                 try:
                     is_med, conf = self.medical_classifier.is_medical_question(user_message)
                     if not is_med and conf > 0.85:
-                        out_of_scope = (
-                            "Xin lỗi bạn, tôi là Trợ lý Y tế Thông minh và chỉ được đào tạo chuyên sâu về "
-                            "lĩnh vực y tế, sức khỏe, bác sĩ và đặt lịch khám bệnh. Tôi không thể hỗ trợ các chủ đề ngoài y tế.\n\n"
-                            "Nếu bạn có bất kỳ câu hỏi nào về sức khỏe, triệu chứng bệnh hoặc cần tìm bác sĩ/gói khám, "
-                            "xin vui lòng hỏi tôi nhé!"
-                        )
-                        yield out_of_scope
-                        self.session_manager.add_user_message(session_id, user_message)
-                        self.session_manager.add_ai_message(session_id, out_of_scope)
-                        return
+                        if not self._is_obviously_medical(user_message):
+                            out_of_scope = (
+                                "Xin lỗi bạn, tôi là Trợ lý Y tế Thông minh và chỉ được đào tạo chuyên sâu về "
+                                "lĩnh vực y tế, sức khỏe, bác sĩ và đặt lịch khám bệnh. Tôi không thể hỗ trợ các chủ đề ngoài y tế.\n\n"
+                                "Nếu bạn có bất kỳ câu hỏi nào về sức khỏe, triệu chứng bệnh hoặc cần tìm bác sĩ/gói khám, "
+                                "xin vui lòng hỏi tôi nhé!"
+                            )
+                            yield out_of_scope
+                            self.session_manager.add_user_message(session_id, user_message)
+                            self.session_manager.add_ai_message(session_id, out_of_scope)
+                            return
+                        else:
+                            logger.info(f"PhoBERT flagged non-medical, but medical indicator matched. Proceeding with streaming.")
                 except Exception as cf_err:
                     logger.warning(f"Classification check skipped: {cf_err}")
 
-            # 4. Sử dụng smart context
-            context = self.get_smart_context(user_message)
-            
-            # 5. Lấy lịch sử trò chuyện theo đúng phiên
-            chat_history = self.session_manager.get_chat_history_str(session_id)
-            
+            # Xử lý nhận diện và ghi nhớ vị trí (Location Intelligence: District & Province)
+            active_loc_display = None
+            active_province = None
+            active_district = None
+
+            if location and isinstance(location, str) and location.strip():
+                f_disp, f_prov, f_dist = self._detect_location_details(location)
+                active_loc_display = f_disp or location.strip()
+                active_province = f_prov
+                active_district = f_dist
+                self.session_manager.set_location(session_id, active_loc_display, active_province, active_district)
+
+            msg_disp, msg_prov, msg_dist = self._detect_location_details(user_message)
+            if msg_disp or msg_prov or msg_dist:
+                active_loc_display = msg_disp or active_loc_display
+                active_province = msg_prov or active_province
+                active_district = msg_dist or active_district
+                self.session_manager.set_location(session_id, active_loc_display, active_province, active_district)
+
+            if not active_loc_display:
+                active_loc_display, active_province, active_district = self.session_manager.get_location_details(session_id)
+
+            location_desc = active_loc_display if active_loc_display else "Chưa rõ vị trí (Cần hỏi người bệnh quận/huyện, tỉnh/thành phố để gợi ý bác sĩ gần nhất)"
+
+            # 4. Sử dụng smart context có ưu tiên vị trí và quận/huyện
+            context = self.get_smart_context(user_message, target_province=active_province, target_district=active_district)
+            context = self._enrich_context_with_doctor_schedule(user_message, chat_history, session_id, context)
+
+            now = datetime.now()
+            day_names = ["Thứ Hai", "Thứ Ba", "Thứ Tư", "Thứ Năm", "Thứ Sáu", "Thứ Bảy", "Chủ Nhật"]
+            today_weekday = day_names[now.weekday()]
+            tomorrow = now + timedelta(days=1)
+            tomorrow_weekday = day_names[tomorrow.weekday()]
+
+            current_date_str = f"{today_weekday}, ngày {now.strftime('%d/%m/%Y')}"
+            tomorrow_date_str = f"{tomorrow_weekday}, ngày {tomorrow.strftime('%d/%m/%Y')}"
+
             # 6. Tạo prompt
             prompt = MEDICAL_SYSTEM_PROMPT.format(
+                current_date_str=current_date_str,
+                tomorrow_date_str=tomorrow_date_str,
                 context=context,
                 chat_history=chat_history,
+                patient_location=location_desc,
                 question=user_message
             )
             
             # 7. Stream response từ LLM
             full_response = ""
             for chunk in self.streaming_llm.stream_response(prompt):
-                full_response += chunk
-                yield chunk
+                chunk_clean = chunk.replace("http://localhost:3000/detail-doctor/", "/detail-doctor/").replace("http://127.0.0.1:3000/detail-doctor/", "/detail-doctor/")
+                full_response += chunk_clean
+                yield chunk_clean
             
+            full_response = self._clean_response_links(full_response)
+
             # Cập nhật memory của phiên với response đầy đủ
             try:
                 self.session_manager.add_user_message(session_id, user_message)
@@ -405,44 +617,19 @@ class EnhancedMedicalChatbot:
             self.session_manager.add_user_message(session_id, user_message)
             self.session_manager.add_ai_message(session_id, fallback_text)
 
-    def _detect_province_from_message(self, message: str) -> Optional[str]:
-        """Tự động phát hiện tỉnh thành từ câu hỏi dựa trên các tỉnh thành thực tế có trong hệ thống."""
-        if not hasattr(self, 'provinces') or not self.provinces:
-            return None
-            
-        msg_lower = message.lower()
-        
-        # Hàm loại bỏ dấu tiếng Việt và ký tự đặc biệt để so sánh chính xác hơn
-        def normalize_str(s):
-            import unicodedata
-            s = unicodedata.normalize('NFKD', s).encode('ascii', 'ignore').decode('utf-8')
-            return s.lower().replace(" ", "")
+    def _detect_location_details(self, message: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+        """
+        Phát hiện chi tiết vị trí (chuỗi hiển thị, tỉnh/thành, quận/huyện)
+        thông qua Dynamic Geographic Resolver (Hỗ trợ 63 tỉnh thành, các quận huyện, mốc địa danh nổi tiếng).
+        """
+        if not hasattr(self, 'geo_resolver') or not self.geo_resolver:
+            self.geo_resolver = default_geo_resolver
+        return self.geo_resolver.resolve_location(message)
 
-        normalized_msg = normalize_str(msg_lower)
-        
-        for province in self.provinces:
-            prov_lower = province.lower()
-            normalized_prov = normalize_str(prov_lower)
-            
-            # Khớp trực tiếp có dấu (ví dụ: "đà nẵng" trong "tôi ở đà nẵng")
-            if prov_lower in msg_lower:
-                return province
-                
-            # Khớp không dấu (ví dụ: "da nang" trong "tôi ở da nang")
-            if normalized_prov in normalized_msg:
-                return province
-                
-            # Các từ viết tắt và tên ngắn phổ biến
-            if prov_lower == "hồ chí minh" and any(abbr in msg_lower for abbr in ["hcm", "tphcm", "sai gon", "sài gòn"]):
-                return province
-            if prov_lower == "hà nội" and "hn" in msg_lower.split():
-                return province
-            if "thừa thiên huế" in prov_lower and any(w in msg_lower for w in ["huế", "hue"]):
-                return province
-            if "đà nẵng" in prov_lower and any(w in msg_lower.split() for w in ["đn", "dn"]):
-                return province
-                
-        return None
+    def _detect_province_from_message(self, message: str) -> Optional[str]:
+        """Tự động phát hiện tỉnh thành từ câu hỏi hoặc địa chỉ của người dùng (tương thích ngược)."""
+        full_display, province, _ = self._detect_location_details(message)
+        return province or full_display
 
     def _get_doctor_suggestions_for_streaming(self, user_message: str) -> List[str]:
         """

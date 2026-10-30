@@ -47,8 +47,8 @@ class GeminiLLM(LLM):
             response = chat.send_message(
                 prompt,
                 generation_config=genai.types.GenerationConfig(
-                    max_output_tokens=4000,  # ✅ TĂNG LÊN ĐỂ CHO PHÉP PHẢN HỒI DÀI
-                    temperature=0.7,
+                    max_output_tokens=4096,
+                    temperature=0.4,
                     top_p=0.8,
                     top_k=40,
                 ),
@@ -89,11 +89,10 @@ class GeminiStreamingLLM(GeminiLLM):
                 response = chat.send_message(
                     prompt,
                     generation_config=genai.types.GenerationConfig(
-                        max_output_tokens=4000,  # ✅ TĂNG ĐỂ CHO PHÉP PHẢN HỒI DÀI
-                        temperature=0.7,
+                        max_output_tokens=4096,  # Tăng lên 4096 để đủ chỗ cho thinking tokens của Gemini 2.5
+                        temperature=0.4,  # Trả lời ngắn gọn, chính xác theo hướng dẫn prompt
                         top_p=0.8,
                         top_k=40,
-                        # ✅ KHÔNG SET STOP SEQUENCES ĐỂ TRÁNH DỪNG SỚM
                     ),
                     stream=True,
                     safety_settings=[
