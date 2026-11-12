@@ -1,7 +1,7 @@
 import time
 import logging
 from typing import Dict, Optional
-from langchain_classic.memory import ConversationBufferWindowMemory
+from langchain.memory import ConversationBufferWindowMemory
 
 logger = logging.getLogger("enhanced_medical_chatbot")
 
